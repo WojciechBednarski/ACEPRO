@@ -96,6 +96,31 @@ class AceSerialManager:
         self._lock = threading.RLock()
         self._serial_lock = threading.Lock()
 
+        # Dedicated writer thread: pyserial's write() can block for up to
+        # write_timeout when the device stops draining its input buffer.
+        # _writer()/_send_frame() run as Klipper reactor timers, so a
+        # blocking write there stalls the whole reactor - and therefore
+        # every other MCU's timing, not just this ACE instance. The real
+        # write() call is made on this thread instead; only its outcome
+        # (success or failure) is marshaled back to the reactor via
+        # reactor.register_async_callback(). Reads stay on the reactor
+        # timer as before - the port is opened with read timeout=0, so
+        # reads were already non-blocking.
+        #
+        # Lifecycle uses a generation counter rather than a shared stop
+        # Event: each connect() starts a thread bound to one serial object
+        # and one generation number, operating ONLY on that local object,
+        # never on self._serial. disconnect() just bumps the generation -
+        # it never joins. The superseded thread notices the mismatch on its
+        # own next loop iteration (within ~0.2s) and closes its own object
+        # itself. This means disconnect() can never block the reactor
+        # waiting for the old thread, and there's no way for two threads to
+        # ever touch the same serial object (each owns exactly one), so
+        # there's no close()-vs-write() race either.
+        self._write_queue = queue.Queue()
+        self._io_thread = None
+        self._io_generation = 0
+
         self._request_id = 1
         self._callback_map = {}
         self.inflight = {}
@@ -170,6 +195,25 @@ class AceSerialManager:
         self.LOCATION_KNOWN_RECONNECT_BACKOFF_MIN = 1.0
         self._reconnect_backoff = self._reconnect_backoff_floor()  # Current backoff delay (increases on failure)
 
+        # Circuit breaker: closing and reopening this port is the one
+        # operation on this whole system independently documented as able
+        # to crash the Pi's USB controller outright (a plain manual
+        # unplug/replug of a healthy connection has done it). A flapping
+        # link must not be allowed to keep re-triggering that operation
+        # indefinitely. Once tripped, automatic reconnection stops entirely
+        # until explicitly cleared (see clear_circuit_breaker()).
+        self.MAX_RECONNECTS_BEFORE_BREAKER = 8
+        self._circuit_breaker_tripped = False
+
+        # Soft-reset-first recovery: prefer clearing our own in-flight
+        # request/response bookkeeping (no USB operation at all) over a
+        # real close()/open() cycle when the device is still enumerated.
+        # Only escalate to a real reconnect() after soft resets in a row
+        # fail to restore communication, or the device has genuinely
+        # vanished (soft reset can't fix that).
+        self.MAX_SOFT_RESETS_BEFORE_HARD = 2
+        self._consecutive_soft_resets = 0
+
         # Communication health supervision
         # Track timeouts and unsolicited messages to detect out-of-sync communication
         self.COMM_SUPERVISION_WINDOW = 30.0     # Monitor last 30 seconds
@@ -195,6 +239,13 @@ class AceSerialManager:
         """Enable ACE Pro and reconnect if not connected."""
         was_disabled = not self._ace_pro_enabled
         self._ace_pro_enabled = True
+
+        if self.clear_circuit_breaker():
+            self.gcode.respond_info(
+                f"ACE[{self.instance_num}]: Auto-reconnect circuit breaker "
+                f"cleared - retrying"
+            )
+            self.ensure_connect_timer()
 
         if was_disabled:
             self.connection_state = "connecting"
@@ -519,6 +570,9 @@ class AceSerialManager:
             )
             return
 
+        if self._circuit_breaker_tripped:
+            return
+
         # Record this connection loss for instability detection. Counting
         # only failed connect attempts (as the callbacks below do) misses the
         # dominant storm pattern: the device re-enumerates and every attempt
@@ -530,6 +584,25 @@ class AceSerialManager:
         self._reconnect_timestamps = [t for t in self._reconnect_timestamps if t > cutoff]
 
         recent_count = len(self._reconnect_timestamps)
+
+        # Closing and reopening this port is the one operation on this
+        # whole system independently confirmed able to crash the Pi's USB
+        # controller outright - a plain manual unplug/replug of an
+        # otherwise-healthy connection has done it once already. A
+        # flapping link must not be allowed to keep re-triggering that
+        # operation indefinitely.
+        if recent_count >= self.MAX_RECONNECTS_BEFORE_BREAKER:
+            self._circuit_breaker_tripped = True
+            self.gcode.respond_info(
+                f'ACE[{self.instance_num}]: {recent_count} reconnects in '
+                f'{int(self.INSTABILITY_WINDOW)}s - giving up auto-reconnect to '
+                f'avoid repeatedly cycling the USB port (this can crash the Pi\'s '
+                f'USB controller). Check cabling/EMI, then run '
+                f'ACE_ENABLE_ACE_PRO to try again.'
+            )
+            self.disconnect()
+            return
+
         self.gcode.respond_info(
             f'ACE[{self.instance_num}]: (Re)connecting '
             f'({recent_count} reconnects in last {int(self.INSTABILITY_WINDOW)}s)'
@@ -550,8 +623,14 @@ class AceSerialManager:
 
             if self.auto_connect(self.instance_num, self._baud):
                 self.gcode.respond_info(f'ACE[{self.instance_num}]: Connected')
-                # Reset backoff on successful connect
-                self._reconnect_backoff = self._reconnect_backoff_floor()
+                # Backoff is intentionally NOT reset here - a device that
+                # opens fine but immediately goes silent again would
+                # otherwise keep retrying at full speed forever with no
+                # escalation. It's only reset once the connection proves
+                # itself stable for a sustained period (see
+                # AceManager._check_connection_health's stabilized
+                # transition, which calls clear_circuit_breaker()-adjacent
+                # reset logic).
                 return self.reactor.NEVER
             else:
                 # Track failed connection attempt for stability detection
@@ -584,11 +663,86 @@ class AceSerialManager:
 
     def ensure_connect_timer(self):
         """Ensure a reconnect timer is scheduled if disconnected."""
+        if self._circuit_breaker_tripped:
+            return
         if self._ace_pro_enabled and not self.is_connected() and self.connect_timer is None:
             self.gcode.respond_info(
                 f'ACE[{self.instance_num}]: No active connect timer, scheduling reconnect'
             )
             self.reconnect(self._reconnect_backoff)
+
+    def clear_circuit_breaker(self):
+        """Clear the auto-reconnect circuit breaker (explicit user action).
+
+        Returns True if it was actually tripped, so callers can decide
+        whether it's worth mentioning.
+        """
+        was_tripped = self._circuit_breaker_tripped
+        self._circuit_breaker_tripped = False
+        self._reconnect_timestamps = []
+        self._reconnect_backoff = self._reconnect_backoff_floor()
+        self._consecutive_soft_resets = 0
+        return was_tripped
+
+    def soft_reset(self):
+        """Clear in-flight request/response bookkeeping without touching
+        the OS-level serial port.
+
+        Unlike reconnect() (close()/open() - the operation independently
+        documented as able to crash this Pi's USB controller), this only
+        clears our own software-side state, so a transient protocol
+        desync (a corrupted frame, a request that will never get a reply)
+        can recover without any USB operation at all.
+
+        Returns False if there's nothing this can fix - not currently
+        connected, or the device isn't enumerated any more (a real
+        disappearance needs an actual reconnect(), not a buffer clear).
+        """
+        if not self.is_connected():
+            return False
+        if self.find_connection_port(self.instance_num) is None:
+            return False
+
+        with self._lock:
+            stale = list(self._callback_map.items())
+            self.inflight.clear()
+            self._callback_map.clear()
+        for rid, cb in stale:
+            if cb:
+                try:
+                    cb(response=None)
+                except Exception as e:
+                    self.gcode.respond_info(
+                        f"ACE[{self.instance_num}]: Soft-reset callback error: {e}"
+                    )
+
+        self.read_buffer = bytearray()
+        try:
+            with self._serial_lock:
+                # reset_input_buffer() (TCIFLUSH) only discards the tty
+                # line discipline's own already-received buffer - no driver
+                # or URB involvement, confirmed safe.
+                #
+                # reset_output_buffer() (TCOFLUSH) is deliberately NOT
+                # called here: it routes through the tty layer's
+                # flush_buffer hook, which for cdc_acm is
+                # acm_tty_flush_buffer() - and that calls usb_unlink_urb()
+                # on any in-use write buffer. That's a real URB
+                # cancellation, the same class of operation as close()
+                # that this whole function exists to avoid. A write that's
+                # actually stuck resolves on its own via the writer
+                # thread's own write_timeout instead.
+                self._serial.reset_input_buffer()
+        except Exception as e:
+            logging.warning(
+                f"ACE[{self.instance_num}]: soft_reset buffer flush error: {e}"
+            )
+
+        self.gcode.respond_info(
+            f"ACE[{self.instance_num}]: Soft reset (cleared {len(stale)} "
+            f"in-flight request(s), USB connection stays open)"
+        )
+        return True
 
     def dwell(self, delay=1.0):
         """Sleep in reactor time."""
@@ -724,7 +878,10 @@ class AceSerialManager:
                 port=port,
                 baudrate=baud,
                 timeout=0,
-                write_timeout=0.1
+                # Blocking here is fine - the real write() call happens on
+                # the dedicated writer thread (_writer_thread_main), never
+                # on the reactor thread. See _write_queue comment above.
+                write_timeout=1.0
             )
             if self._serial.is_open:
                 self._connected = True
@@ -747,14 +904,28 @@ class AceSerialManager:
                 # DON'T reset _request_id on reconnect - old responses may still arrive
                 # Resetting to 0 would cause ID collisions with stale ACE responses
 
-                # Flush buffers to discard any stale data from previous session
+                # Flush buffers to discard any stale data from previous session.
+                # reset_output_buffer() (TCOFLUSH) deliberately NOT called - it
+                # routes through cdc_acm's flush_buffer hook into
+                # usb_unlink_urb(), a real URB cancellation (same class of
+                # kernel operation this whole investigation is about), for no
+                # benefit here since nothing has been written yet on a fresh
+                # open.
                 self._serial.reset_input_buffer()
-                self._serial.reset_output_buffer()
 
                 if self.writer_timer is None:
                     self.writer_timer = self.reactor.register_timer(self._writer, self.reactor.NOW)
                 if self.reader_timer is None:
                     self.reader_timer = self.reactor.register_timer(self._reader, self.reactor.NOW)
+
+                self._io_generation += 1
+                self._io_thread = threading.Thread(
+                    target=self._writer_thread_main,
+                    args=(self._serial, self._io_generation),
+                    daemon=True,
+                    name=f"ACE{self.instance_num}-writer",
+                )
+                self._io_thread.start()
 
                 if self.connect_timer is not None:
                     self.reactor.unregister_timer(self.connect_timer)
@@ -800,11 +971,19 @@ class AceSerialManager:
         """Close serial connection and stop all timers."""
         self.stop_heartbeat()
 
-        if self._serial and self._serial.is_open:
-            try:
-                self._serial.close()
-            except Exception as e:
-                logging.error(f"ACE[{self.instance_num}]: Error closing serial: {e}")
+        # Invalidate the current writer thread rather than joining it: it
+        # notices the generation mismatch on its own next loop iteration
+        # (within ~0.2s) and closes its OWN serial object itself (see
+        # _writer_thread_main). This never blocks the reactor waiting on
+        # the thread, and self._serial is intentionally left untouched
+        # here - connect() will assign a fresh object when it reopens, and
+        # is_connected() is already correctly False as soon as
+        # self._connected is cleared below, regardless of exactly when the
+        # old fd actually finishes closing.
+        self._io_generation += 1
+        self._io_thread = None
+        with self._write_queue.mutex:
+            self._write_queue.queue.clear()
 
         # Release our claim on the port so other instances can use it again
         # (e.g. after a topology change or if this instance's real physical
@@ -962,9 +1141,12 @@ class AceSerialManager:
         timeout_count = len(self._comm_timeout_timestamps)
         unsolicited_count = len(self._comm_unsolicited_timestamps)
 
-        # Check thresholds - BOTH conditions must be met
-        if timeout_count >= self.COMM_TIMEOUT_THRESHOLD and unsolicited_count >= self.COMM_UNSOLICITED_THRESHOLD:
-            return False, f"{timeout_count} timeouts AND {unsolicited_count} unsolicited messages in last {self.COMM_SUPERVISION_WINDOW}s"
+        # Either signal alone is meaningful: a silent device produces zero
+        # unsolicited messages, so requiring both (the original condition)
+        # could never fire for exactly the failure mode this exists to
+        # catch.
+        if timeout_count >= self.COMM_TIMEOUT_THRESHOLD or unsolicited_count >= self.COMM_UNSOLICITED_THRESHOLD:
+            return False, f"{timeout_count} timeouts, {unsolicited_count} unsolicited messages in last {self.COMM_SUPERVISION_WINDOW}s"
 
         return True, "healthy"
 
@@ -1143,6 +1325,25 @@ class AceSerialManager:
         """Send a serialized request frame."""
         if not self.is_connected():
             self.gcode.respond_info(f"ACE[{self.instance_num}]: Serial not connected, skipping send")
+            # _writer already registered this rid in inflight/_callback_map
+            # before calling us (it assigns the id and reserves the window
+            # slot up front) - if we bail here without cleaning that up, it
+            # sits until the 5s timeout scan, then counts as a real
+            # communication failure it never actually was.
+            rid = request.get('id')
+            cb = None
+            if rid is not None:
+                with self._lock:
+                    if rid in self.inflight:
+                        self.inflight.pop(rid, None)
+                        cb = self._callback_map.pop(rid, None)
+            if cb:
+                try:
+                    cb(response=None)
+                except Exception as cb_e:
+                    self.gcode.respond_info(
+                        f"ACE[{self.instance_num}]: Not-connected callback error: {cb_e}"
+                    )
             return
 
         with self._lock:
@@ -1153,39 +1354,110 @@ class AceSerialManager:
 
         data = self.protocol.serialize_request_frame(request, self._calc_crc)
 
+        # Hand off to the writer thread; the real write() (and any
+        # timeout/error it raises) happens there, off the reactor thread.
+        # See _writer_thread_main / _handle_write_timeout / _handle_write_error.
+        self._write_queue.put((data, request.get('id')))
+
+    def _writer_thread_main(self, serial_obj, generation):
+        """Background thread: performs the actual blocking serial write()
+        for one connection's lifetime, identified by `generation`.
+
+        Operates ONLY on the `serial_obj` it was started with - never on
+        self._serial - so connect()/disconnect() can freely replace
+        self._serial for a new connection without any coordination with
+        this thread. Once this thread notices (via `generation`) that it's
+        been superseded, it closes its OWN serial_obj itself and exits: no
+        join, no shared stop-event, so disconnect() never blocks the
+        reactor waiting for this thread, and no two threads ever touch the
+        same serial object (each owns exactly one for its whole life).
+
+        CONFIRMED (field-tested): repeatedly calling write() on a device
+        that has already been physically disconnected - one failure after
+        another, each one a fresh usb_submit_urb() the kernel driver has
+        to reject - is what actually wedges this Pi's USB controller. A
+        single failed write is not enough; a `while true` loop retrying a
+        write once a second against an already-unplugged port reliably
+        killed it within ~5 seconds (`acm_start_wb - usb_submit_urb(write
+        bulk) failed: -19` once per attempt, then xHCI death). A read-only
+        `cat` held open across the same unplug/replug did NOT kill it.
+        So: the very first write failure (timeout or otherwise) must stop
+        this generation from ever calling write() again - reconnection
+        happens by spinning up a brand new generation/object, never by
+        continuing to retry on this one.
+        """
+        write_failed = False
+        while self._io_generation == generation:
+            try:
+                data, rid = self._write_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if self._io_generation != generation:
+                break
+
+            if write_failed:
+                # Already known dead this generation - do not submit
+                # another write to it. See docstring above for why.
+                self.reactor.register_async_callback(
+                    lambda et, rid=rid: self._handle_write_error(
+                        rid, "device already failed, not retrying"
+                    )
+                )
+                continue
+
+            try:
+                with self._serial_lock:
+                    serial_obj.write(data)
+            except serial.SerialTimeoutException as e:
+                write_failed = True
+                self.reactor.register_async_callback(
+                    lambda et, rid=rid, e=e: self._handle_write_timeout(rid, e)
+                )
+            except Exception as e:
+                write_failed = True
+                self.reactor.register_async_callback(
+                    lambda et, rid=rid, e=e: self._handle_write_error(rid, e)
+                )
+
+        # Superseded (or the only connection ever had) - closing this
+        # specific object is this thread's own responsibility now.
         try:
-            with self._serial_lock:
-                self._serial.write(data)
-        except serial.SerialTimeoutException as e:
-            self.gcode.respond_info(
-                f"ACE[{self.instance_num}]: Serial write timeout: {e} (clearing inflight)"
-            )
-            with self._lock:
-                rid = request.get('id')
-                if rid in self.inflight:
-                    self.inflight.pop(rid, None)
-                    cb = self._callback_map.pop(rid, None)
-                    if cb:
-                        try:
-                            cb(response=None)
-                        except Exception as cb_e:
-                            self.gcode.respond_info(
-                                f"ACE[{self.instance_num}]: Timeout callback error: {cb_e}"
-                            )
+            if serial_obj.is_open:
+                serial_obj.close()
         except Exception as e:
-            self.gcode.respond_info(f"ACE[{self.instance_num}]: Serial write error: {e}")
-            with self._lock:
-                rid = request.get('id')
-                if rid in self.inflight:
-                    self.inflight.pop(rid, None)
-                    cb = self._callback_map.pop(rid, None)
-                    if cb:
-                        try:
-                            cb(response=None)
-                        except Exception as cb_e:
-                            self.gcode.respond_info(
-                                f"ACE[{self.instance_num}]: Error callback error: {cb_e}"
-                            )
+            logging.error(f"ACE[{self.instance_num}]: Error closing serial: {e}")
+
+    def _handle_write_timeout(self, rid, err):
+        """Reactor-thread cleanup after the writer thread's write() timed out."""
+        self.gcode.respond_info(
+            f"ACE[{self.instance_num}]: Serial write timeout: {err} (clearing inflight)"
+        )
+        with self._lock:
+            if rid in self.inflight:
+                self.inflight.pop(rid, None)
+                cb = self._callback_map.pop(rid, None)
+                if cb:
+                    try:
+                        cb(response=None)
+                    except Exception as cb_e:
+                        self.gcode.respond_info(
+                            f"ACE[{self.instance_num}]: Timeout callback error: {cb_e}"
+                        )
+
+    def _handle_write_error(self, rid, err):
+        """Reactor-thread cleanup after the writer thread's write() raised."""
+        self.gcode.respond_info(f"ACE[{self.instance_num}]: Serial write error: {err}")
+        with self._lock:
+            if rid in self.inflight:
+                self.inflight.pop(rid, None)
+                cb = self._callback_map.pop(rid, None)
+                if cb:
+                    try:
+                        cb(response=None)
+                    except Exception as cb_e:
+                        self.gcode.respond_info(
+                            f"ACE[{self.instance_num}]: Error callback error: {cb_e}"
+                        )
 
     # ========== Frame Reading and Parsing ==========
 

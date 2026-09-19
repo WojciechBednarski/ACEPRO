@@ -158,6 +158,7 @@ class AceInstance:
         )
         self._status_failure_streak = 0
         self._status_recovery_in_progress = False
+        self._consecutive_soft_resets = 0
 
         self.status_debug_logging = bool(ace_config.get("status_debug_logging", False))
         self.supervision_enabled = bool(ace_config.get("ace_connection_supervision", True))
@@ -2027,12 +2028,21 @@ class AceInstance:
             self._record_status_failure(str(msg))
 
     def _reset_status_failure_tracking(self):
-        """Clear heartbeat/status failure tracking after successful communication."""
+        """Clear heartbeat/status failure tracking after successful communication.
+
+        Called on every successful heartbeat (not just right after a
+        reconnect), so resetting the *consecutive*-failure streak here is
+        correct - one success genuinely does break a failure streak. The
+        cross-cycle memory that a device keeps flapping lives elsewhere
+        (serial_mgr's time-windowed reconnect count feeding the circuit
+        breaker, and _consecutive_soft_resets/backoff, which only reset on
+        sustained stability - see AceManager._check_connection_health).
+        """
         self._status_failure_streak = 0
         self._status_recovery_in_progress = False
 
     def _record_status_failure(self, reason):
-        """Track one failed heartbeat/status response and trigger reconnect if needed."""
+        """Track one failed heartbeat/status response and trigger recovery if needed."""
         self._status_failure_streak += 1
         if self._status_failure_streak < self.status_failure_threshold:
             return
@@ -2040,6 +2050,40 @@ class AceInstance:
             return
 
         self._status_recovery_in_progress = True
+
+        # Prefer a soft reset (clear our own request/response bookkeeping -
+        # no USB operation at all) over a real reconnect() (close()/open(),
+        # independently confirmed able to crash this Pi's USB controller
+        # outright - a plain manual unplug/replug has done it) for the
+        # first couple of attempts, as long as the device is still
+        # enumerated. Only escalate to a real reconnect if soft resets in a
+        # row fail to restore communication, or the device has genuinely
+        # vanished (a soft reset can't fix that).
+        soft_reset = getattr(self.serial_mgr, "soft_reset", None)
+        max_soft = getattr(self.serial_mgr, "MAX_SOFT_RESETS_BEFORE_HARD", 0)
+        if callable(soft_reset) and self._consecutive_soft_resets < max_soft:
+            self.gcode.respond_info(
+                f"ACE[{self.instance_num}]: Heartbeat/status failed "
+                f"{self._status_failure_streak} times ({reason}) - "
+                f"soft-resetting (attempt {self._consecutive_soft_resets + 1}/{max_soft})"
+            )
+            try:
+                if soft_reset():
+                    self._consecutive_soft_resets += 1
+                    self._status_failure_streak = 0
+                    self._status_recovery_in_progress = False
+                    return
+            except Exception as exc:
+                logging.warning(
+                    "ACE[%s]: soft_reset() after status failures failed: %s",
+                    self.instance_num,
+                    exc,
+                )
+            # soft_reset() returned False (not connected, or the device
+            # isn't enumerated any more) - fall through to a real
+            # reconnect below; it's the only thing that can help now.
+
+        self._consecutive_soft_resets = 0
         self.gcode.respond_info(
             f"ACE[{self.instance_num}]: Heartbeat/status failed "
             f"{self._status_failure_streak} times ({reason}) - reconnecting"

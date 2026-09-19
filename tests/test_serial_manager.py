@@ -9,6 +9,8 @@ Focus: Testing actual production code without heavy I/O mocking.
 """
 import pytest
 import queue
+import threading
+import time
 from types import SimpleNamespace
 import struct
 import json
@@ -877,7 +879,15 @@ class TestConnectionLifecycle:
         self.manager.reconnect()
         assert any("not reconnecting" in args[0] for args, _ in self.mock_gcode.respond_info.call_args_list)
 
-    def test_reconnect_success_resets_backoff(self):
+    def test_reconnect_success_does_not_reset_backoff(self):
+        """A bare successful open must NOT reset backoff by itself.
+
+        Only a sustained-stable connection (AceManager._check_connection_
+        health's stabilized transition) resets it - otherwise a device
+        that opens fine but immediately goes silent again would keep
+        retrying (and re-cycling the USB port) at full speed forever, with
+        no escalation.
+        """
         captured = {}
         def register_timer(cb, when):
             captured["cb"] = cb
@@ -888,7 +898,7 @@ class TestConnectionLifecycle:
         self.manager.reconnect()
         ret = captured["cb"](0.0)
         assert ret == self.mock_reactor.NEVER
-        assert self.manager._reconnect_backoff == self.manager.RECONNECT_BACKOFF_MIN
+        assert self.manager._reconnect_backoff == 10.0
     
     def test_ensure_connect_timer_schedules_when_needed(self):
         self.manager._ace_pro_enabled = True
@@ -929,65 +939,56 @@ class TestConnectionLifecycle:
         self.manager._serial.write.assert_not_called()
 
     def test_send_frame_timeout_clears_inflight(self):
-        import ace.serial_manager as sm
-        timeout_exc = type("Timeout", (Exception,), {})
-        sm.serial.SerialTimeoutException = timeout_exc
-        self.manager._connected = True
-        self.manager._serial.write.side_effect = timeout_exc("boom")
+        # The write itself now happens on the writer thread; a timeout there
+        # is reported back via _handle_write_timeout (see _writer_thread_main).
         cb = Mock()
         self.manager.inflight = {1: 0.0}
         self.manager._callback_map = {1: cb}
-        from ace.serial_manager import AceSerialManager
-        AceSerialManager._send_frame(self.manager, {"id": 1, "method": "ping"})
+        self.manager._handle_write_timeout(1, Exception("boom"))
         cb.assert_called_once_with(response=None)
 
     def test_send_frame_timeout_callback_error_logged(self):
-        import ace.serial_manager as sm
-        timeout_exc = type("Timeout", (Exception,), {})
-        sm.serial.SerialTimeoutException = timeout_exc
-        self.manager._connected = True
-        self.manager._serial.write.side_effect = timeout_exc("boom")
         cb = Mock(side_effect=RuntimeError("cb boom"))
         self.manager.inflight = {1: 0.0}
         self.manager._callback_map = {1: cb}
-        from ace.serial_manager import AceSerialManager
-        AceSerialManager._send_frame(self.manager, {"id": 1, "method": "ping"})
+        self.manager._handle_write_timeout(1, Exception("boom"))
         assert any("Timeout callback error" in args[0] for args, _ in self.mock_gcode.respond_info.call_args_list)
 
     def test_send_frame_generic_error_clears_inflight(self):
-        self.manager._connected = True
-        self.manager._serial.write.side_effect = RuntimeError("write fail")
+        # The write itself now happens on the writer thread; a generic
+        # failure there is reported back via _handle_write_error.
         cb = Mock(side_effect=RuntimeError("cb fail"))
         self.manager.inflight = {2: 0.0}
         self.manager._callback_map = {2: cb}
-        from ace.serial_manager import AceSerialManager
-        AceSerialManager._send_frame(self.manager, {"id": 2, "method": "pong"})
+        self.manager._handle_write_error(2, RuntimeError("write fail"))
         assert any("Serial write error" in args[0] for args, _ in self.mock_gcode.respond_info.call_args_list)
         assert any("Error callback error" in args[0] for args, _ in self.mock_gcode.respond_info.call_args_list)
 
     def test_send_frame_success_writes_data(self):
-        """Test _send_frame happy path - successfully sends data."""
+        """Test _send_frame happy path - queues a properly framed request
+        for the writer thread (the actual serial write is no longer made
+        directly by _send_frame - see _writer_thread_main)."""
         # Restore real _send_frame method for this test
         from ace.serial_manager import AceSerialManager
         self.manager._send_frame = AceSerialManager._send_frame.__get__(self.manager, AceSerialManager)
-        
+
         self.manager._connected = True
         self.manager._serial = Mock()
         self.manager._serial.is_open = True
-        self.manager._serial.write = Mock()
         self.manager._request_id = 10
-        
+
         request = {"method": "ping"}
         self.manager._send_frame(request)
-        
-        # Verify write was called with properly formatted frame
-        self.manager._serial.write.assert_called_once()
-        sent_data = self.manager._serial.write.call_args[0][0]
-        
+
+        # Verify a properly formatted frame was queued for the writer thread
+        assert self.manager._write_queue.qsize() == 1
+        sent_data, queued_rid = self.manager._write_queue.get_nowait()
+
         # Verify frame structure: header (2) + len (2) + payload + crc (2) + terminator (1)
         assert sent_data[0:2] == bytes([0xFF, 0xAA])  # Header
         assert sent_data[-1:] == b'\xFE'  # Terminator
-        
+        assert queued_rid == 10
+
         # Verify request got an ID assigned
         assert request['id'] == 10
         assert self.manager._request_id == 11
@@ -2507,44 +2508,48 @@ class TestCommunicationSupervision:
         assert is_healthy is True
         assert reason == "healthy"
     
-    def test_check_communication_health_healthy_only_timeouts(self):
-        """Test that health check returns healthy with only timeouts (AND condition)."""
+    def test_check_communication_health_unhealthy_only_timeouts(self):
+        """Timeouts alone are enough to flag unhealthy (OR condition).
+
+        A silent device produces zero unsolicited messages, so requiring
+        both signals together (the original AND) could never fire for
+        exactly the failure mode this check exists to catch.
+        """
         self.mock_reactor.monotonic.return_value = 100.0
-        
-        # 20 timeouts but only 5 unsolicited - NOT unhealthy
+
         self.manager._comm_timeout_timestamps = [90.0] * 20
         self.manager._comm_unsolicited_timestamps = [90.0] * 5
-        
+
         is_healthy, reason = self.manager._check_communication_health()
-        
-        assert is_healthy is True
-        assert reason == "healthy"
-    
-    def test_check_communication_health_healthy_only_unsolicited(self):
-        """Test that health check returns healthy with only unsolicited (AND condition)."""
+
+        assert is_healthy is False
+        assert "20 timeouts" in reason
+
+    def test_check_communication_health_unhealthy_only_unsolicited(self):
+        """Unsolicited messages alone are enough to flag unhealthy (OR condition)."""
         self.mock_reactor.monotonic.return_value = 100.0
-        
-        # 20 unsolicited but only 5 timeouts - NOT unhealthy
+
         self.manager._comm_timeout_timestamps = [90.0] * 5
         self.manager._comm_unsolicited_timestamps = [90.0] * 20
-        
+
         is_healthy, reason = self.manager._check_communication_health()
-        
-        assert is_healthy is True
-        assert reason == "healthy"
-    
+
+        assert is_healthy is False
+        assert "20 unsolicited" in reason
+
     def test_check_communication_health_unhealthy_both_thresholds(self):
-        """Test that health check returns unhealthy when BOTH thresholds exceeded."""
+        """Test that health check returns unhealthy when both thresholds exceeded."""
         self.mock_reactor.monotonic.return_value = 100.0
-        
+
         # 15+ of each - should be unhealthy
         self.manager._comm_timeout_timestamps = [90.0] * 16
         self.manager._comm_unsolicited_timestamps = [90.0] * 17
-        
+
         is_healthy, reason = self.manager._check_communication_health()
-        
+
         assert is_healthy is False
-        assert "16 timeouts AND 17 unsolicited" in reason
+        assert "16 timeouts" in reason
+        assert "17 unsolicited" in reason
     
     def test_check_communication_health_prunes_old_entries(self):
         """Test that health check prunes old entries before counting."""
@@ -2886,6 +2891,353 @@ class TestHandleInfoResponse:
         logged_lines = [call.args[0] for call in self.mock_gcode.respond_info.call_args_list]
         assert any("GET_INFO raw_info:" in line for line in logged_lines)
         assert any("GET_INFO summary:" in line for line in logged_lines)
+
+
+class TestCircuitBreaker:
+    """Coverage for the auto-reconnect circuit breaker.
+
+    Closing and reopening this port is the one operation on this whole
+    system independently confirmed able to crash the Pi's USB controller
+    outright (a plain manual unplug/replug of a healthy connection has
+    done it). A flapping link must never be able to keep re-triggering
+    that operation indefinitely.
+    """
+
+    def setup_method(self):
+        self.serial_patch = patch('ace.serial_manager.serial')
+        self.serial_mod = self.serial_patch.start()
+        self.serial_mod.SerialTimeoutException = type("Timeout", (Exception,), {})
+        self.serial_mod.SerialException = Exception
+        self.serial_mod.tools = Mock()
+        self.serial_mod.tools.list_ports = Mock()
+
+        from ace.serial_manager import AceSerialManager
+
+        self.mock_gcode = Mock()
+        self.mock_reactor = Mock()
+        self.mock_reactor.NOW = 0.0
+        self.mock_reactor.NEVER = 999.0
+        self.mock_reactor.monotonic.return_value = 0.0
+        self.mock_reactor.pause = Mock()
+        self.mock_reactor.register_timer = Mock()
+
+        self.manager = AceSerialManager(
+            gcode=self.mock_gcode,
+            reactor=self.mock_reactor,
+            instance_num=0,
+            ace_enabled=True,
+        )
+        self.manager.disconnect = Mock()
+
+    def teardown_method(self):
+        self.serial_patch.stop()
+
+    def test_trips_after_max_reconnects_in_window(self):
+        for _ in range(self.manager.MAX_RECONNECTS_BEFORE_BREAKER):
+            assert self.manager._circuit_breaker_tripped is False
+            self.manager.reconnect()
+
+        assert self.manager._circuit_breaker_tripped is True
+        # disconnect() is called once per reconnect(), including the one
+        # that trips the breaker, and never again after that.
+        assert self.manager.disconnect.call_count == self.manager.MAX_RECONNECTS_BEFORE_BREAKER
+
+    def test_tripped_breaker_blocks_further_reconnects(self):
+        self.manager._circuit_breaker_tripped = True
+        self.manager.reconnect()
+        self.manager.disconnect.assert_not_called()
+        assert len(self.manager._reconnect_timestamps) == 0
+
+    def test_tripped_breaker_blocks_ensure_connect_timer(self):
+        self.manager._circuit_breaker_tripped = True
+        self.manager._ace_pro_enabled = True
+        self.manager._connected = False
+        self.manager.connect_timer = None
+        self.manager.reconnect = Mock()
+
+        self.manager.ensure_connect_timer()
+
+        self.manager.reconnect.assert_not_called()
+
+    def test_clear_circuit_breaker_resets_state(self):
+        self.manager._circuit_breaker_tripped = True
+        self.manager._reconnect_timestamps = [1.0, 2.0, 3.0]
+        self.manager._reconnect_backoff = 30.0
+        self.manager._consecutive_soft_resets = 2
+
+        was_tripped = self.manager.clear_circuit_breaker()
+
+        assert was_tripped is True
+        assert self.manager._circuit_breaker_tripped is False
+        assert self.manager._reconnect_timestamps == []
+        assert self.manager._reconnect_backoff == self.manager._reconnect_backoff_floor()
+        assert self.manager._consecutive_soft_resets == 0
+
+    def test_clear_circuit_breaker_reports_not_tripped(self):
+        assert self.manager.clear_circuit_breaker() is False
+
+    def test_enable_ace_pro_clears_breaker_and_kicks_reconnect(self):
+        self.manager._circuit_breaker_tripped = True
+        self.manager._ace_pro_enabled = True  # already enabled, not a fresh enable
+        self.manager.ensure_connect_timer = Mock()
+
+        self.manager.enable_ace_pro()
+
+        assert self.manager._circuit_breaker_tripped is False
+        self.manager.ensure_connect_timer.assert_called_once()
+
+
+class TestSoftReset:
+    """Coverage for soft_reset() - the preferred, non-USB-touching recovery
+    path tried before a real reconnect() (close()/open())."""
+
+    def setup_method(self):
+        self.serial_patch = patch('ace.serial_manager.serial')
+        self.serial_mod = self.serial_patch.start()
+        self.serial_mod.SerialTimeoutException = type("Timeout", (Exception,), {})
+        self.serial_mod.SerialException = Exception
+        self.serial_mod.tools = Mock()
+        self.serial_mod.tools.list_ports = Mock()
+
+        from ace.serial_manager import AceSerialManager
+
+        self.mock_gcode = Mock()
+        self.mock_reactor = Mock()
+        self.mock_reactor.NOW = 0.0
+        self.mock_reactor.NEVER = 999.0
+        self.mock_reactor.monotonic.return_value = 0.0
+        self.mock_reactor.pause = Mock()
+        self.mock_reactor.register_timer = Mock()
+
+        self.manager = AceSerialManager(
+            gcode=self.mock_gcode,
+            reactor=self.mock_reactor,
+            instance_num=0,
+            ace_enabled=True,
+        )
+        self.manager._serial = Mock()
+        self.manager._serial_lock = Mock(__enter__=Mock(return_value=None), __exit__=Mock(return_value=False))
+        self.manager._connected = True
+
+    def teardown_method(self):
+        self.serial_patch.stop()
+
+    def test_returns_false_when_not_connected(self):
+        self.manager._connected = False
+        assert self.manager.soft_reset() is False
+
+    def test_returns_false_when_device_not_enumerated(self):
+        self.manager.find_connection_port = Mock(return_value=None)
+        assert self.manager.soft_reset() is False
+        # Nothing to fix by clearing buffers if the device is genuinely
+        # gone - must not touch the port at all in that case.
+        self.manager._serial.reset_input_buffer.assert_not_called()
+
+    def test_clears_inflight_and_fires_callbacks_with_none(self):
+        self.manager.find_connection_port = Mock(return_value="/dev/ttyACM0")
+        cb1, cb2 = Mock(), Mock()
+        self.manager.inflight = {1: 0.0, 2: 0.0}
+        self.manager._callback_map = {1: cb1, 2: cb2}
+        self.manager.read_buffer = bytearray(b"garbage")
+
+        result = self.manager.soft_reset()
+
+        assert result is True
+        assert self.manager.inflight == {}
+        assert self.manager._callback_map == {}
+        assert self.manager.read_buffer == bytearray()
+        cb1.assert_called_once_with(response=None)
+        cb2.assert_called_once_with(response=None)
+
+    def test_does_not_close_or_reopen_the_port(self):
+        """The entire point of soft_reset: it must never touch the fd's
+        open/closed state, only its buffers."""
+        self.manager.find_connection_port = Mock(return_value="/dev/ttyACM0")
+
+        self.manager.soft_reset()
+
+        self.manager._serial.close.assert_not_called()
+        self.manager._serial.reset_input_buffer.assert_called_once()
+
+    def test_never_flushes_the_output_buffer(self):
+        """reset_output_buffer() (TCOFLUSH) routes through cdc_acm's
+        flush_buffer hook straight into usb_unlink_urb() - a real URB
+        cancellation, the same class of kernel operation as close(). Must
+        never be called here, regardless of connection state."""
+        self.manager.find_connection_port = Mock(return_value="/dev/ttyACM0")
+
+        self.manager.soft_reset()
+
+        self.manager._serial.reset_output_buffer.assert_not_called()
+
+    def test_callback_exception_does_not_prevent_return_true(self):
+        self.manager.find_connection_port = Mock(return_value="/dev/ttyACM0")
+        self.manager._callback_map = {1: Mock(side_effect=RuntimeError("boom"))}
+        self.manager.inflight = {1: 0.0}
+
+        assert self.manager.soft_reset() is True
+        assert any(
+            "Soft-reset callback error" in args[0]
+            for args, _ in self.mock_gcode.respond_info.call_args_list
+        )
+
+
+class TestWriterThreadGeneration:
+    """Coverage for the writer thread's generation-based lifecycle.
+
+    A superseded thread must exit and close its OWN serial object on its
+    own initiative - never touching a later connection's object - and
+    disconnect() must never need to join/block on it.
+    """
+
+    def setup_method(self):
+        self.serial_patch = patch('ace.serial_manager.serial')
+        self.serial_mod = self.serial_patch.start()
+        self.serial_mod.SerialTimeoutException = type("Timeout", (Exception,), {})
+        self.serial_mod.SerialException = Exception
+
+        from ace.serial_manager import AceSerialManager
+
+        self.mock_gcode = Mock()
+        self.mock_reactor = Mock()
+        self.mock_reactor.monotonic.return_value = 0.0
+        self.mock_reactor.register_async_callback = Mock()
+
+        self.manager = AceSerialManager(
+            gcode=self.mock_gcode,
+            reactor=self.mock_reactor,
+            instance_num=0,
+            ace_enabled=True,
+        )
+        self.manager._serial_lock = Mock(__enter__=Mock(return_value=None), __exit__=Mock(return_value=False))
+
+    def teardown_method(self):
+        self.serial_patch.stop()
+
+    def _make_fake_serial(self):
+        obj = Mock()
+        obj.is_open = True
+
+        def _close():
+            obj.is_open = False
+
+        obj.close.side_effect = _close
+        return obj
+
+    def _wait_until(self, predicate, timeout=2.0, interval=0.02):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if predicate():
+                return True
+            time.sleep(interval)
+        return False
+
+    def test_superseded_thread_closes_its_own_object_and_stops(self):
+        gen1 = 1
+        self.manager._io_generation = gen1
+        serial1 = self._make_fake_serial()
+        t = threading.Thread(
+            target=self.manager._writer_thread_main,
+            args=(serial1, gen1),
+            daemon=True,
+        )
+        t.start()
+        time.sleep(0.05)  # let it actually enter its loop
+
+        # Simulate disconnect(): bump the generation, no join.
+        self.manager._io_generation = gen1 + 1
+
+        assert self._wait_until(lambda: not t.is_alive()), "thread did not exit"
+        serial1.close.assert_called_once()
+
+    def test_superseded_thread_never_touches_the_new_generations_object(self):
+        gen1 = 1
+        self.manager._io_generation = gen1
+        serial1 = self._make_fake_serial()
+        t1 = threading.Thread(
+            target=self.manager._writer_thread_main,
+            args=(serial1, gen1),
+            daemon=True,
+        )
+        t1.start()
+        time.sleep(0.05)
+
+        gen2 = gen1 + 1
+        self.manager._io_generation = gen2
+        assert self._wait_until(lambda: not t1.is_alive()), "old thread did not exit"
+        serial1.close.assert_called_once()
+
+        serial2 = self._make_fake_serial()
+        t2 = threading.Thread(
+            target=self.manager._writer_thread_main,
+            args=(serial2, gen2),
+            daemon=True,
+        )
+        t2.start()
+
+        self.manager._write_queue.put((b"hello", 42))
+
+        assert self._wait_until(lambda: serial2.write.called), "new generation never wrote"
+        serial1.write.assert_not_called()
+
+        # Clean up: supersede gen2 too so its thread exits.
+        self.manager._io_generation = gen2 + 1
+        assert self._wait_until(lambda: not t2.is_alive())
+
+    def test_stops_writing_after_first_failure_does_not_retry_on_dead_device(self):
+        """Field-confirmed: repeatedly calling write() on an already-
+        disconnected device (one failure after another) is what actually
+        wedges this Pi's USB controller - a single failed write is not
+        enough, but a loop retrying once a second reliably killed it
+        within ~5 seconds. So after the first failure this generation must
+        never call serial_obj.write() again, no matter how many more items
+        get queued."""
+        gen1 = 1
+        self.manager._io_generation = gen1
+        serial1 = self._make_fake_serial()
+        serial1.write.side_effect = OSError(19, "No such device")
+        t = threading.Thread(
+            target=self.manager._writer_thread_main,
+            args=(serial1, gen1),
+            daemon=True,
+        )
+        t.start()
+
+        self.manager._write_queue.put((b"first", 1))
+        assert self._wait_until(lambda: serial1.write.call_count >= 1)
+
+        # Queue several more writes after the first one already failed.
+        for rid in (2, 3, 4):
+            self.manager._write_queue.put((b"more", rid))
+        time.sleep(0.3)  # let the thread drain all of them if it's going to
+
+        assert serial1.write.call_count == 1, (
+            "writer thread called write() again after a prior failure on "
+            "the same device - this is exactly the pattern confirmed to "
+            "crash the Pi's USB controller"
+        )
+
+        self.manager._io_generation = gen1 + 1
+        assert self._wait_until(lambda: not t.is_alive())
+
+    def test_write_failure_reports_back_via_async_callback_not_exception(self):
+        gen1 = 1
+        self.manager._io_generation = gen1
+        serial1 = self._make_fake_serial()
+        serial1.write.side_effect = self.serial_mod.SerialTimeoutException("boom")
+        t = threading.Thread(
+            target=self.manager._writer_thread_main,
+            args=(serial1, gen1),
+            daemon=True,
+        )
+        t.start()
+
+        self.manager._write_queue.put((b"hello", 7))
+
+        assert self._wait_until(lambda: self.mock_reactor.register_async_callback.called)
+
+        self.manager._io_generation = gen1 + 1
+        assert self._wait_until(lambda: not t.is_alive())
 
 
 if __name__ == '__main__':

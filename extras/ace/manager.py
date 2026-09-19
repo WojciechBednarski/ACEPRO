@@ -2459,6 +2459,18 @@ class AceManager:
                     f"ACE[{instance_num}]: Connection stabilized "
                     f"(connected for {status['time_connected']:.0f}s)"
                 )
+                # This is the ONLY place the failure streak, soft-reset
+                # count, and reconnect backoff get reset - deliberately not
+                # on a bare successful open, which would let a device that
+                # opens fine but immediately goes silent again keep
+                # retrying (and re-cycling the USB port) at full speed
+                # forever with no escalation. A confirmed sustained-healthy
+                # connection is what actually earns a fresh start.
+                instance._status_failure_streak = 0
+                instance._consecutive_soft_resets = 0
+                instance.serial_mgr._reconnect_backoff = (
+                    instance.serial_mgr._reconnect_backoff_floor()
+                )
                 # Clear dialog if all instances are now stable
                 if self._connection_issue_shown:
                     all_stable = all(

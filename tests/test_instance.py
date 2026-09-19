@@ -1930,6 +1930,10 @@ class TestStatusCallbacks(unittest.TestCase):
         ace_config = dict(self.ace_config)
         ace_config['status_failure_threshold'] = 2
         instance = AceInstance(0, ace_config, self.mock_printer)
+        # Disable the soft-reset-first path so this test exercises the
+        # direct-to-reconnect behavior it's actually named for; soft reset
+        # itself is covered separately.
+        instance.serial_mgr.MAX_SOFT_RESETS_BEFORE_HARD = 0
 
         instance._on_heartbeat_response(None)
         instance._on_heartbeat_response(None)
@@ -1938,6 +1942,61 @@ class TestStatusCallbacks(unittest.TestCase):
         instance.serial_mgr.reconnect.assert_called_once_with()
         self.assertEqual(instance._status_failure_streak, 3)
         self.assertTrue(instance._status_recovery_in_progress)
+
+    @patch('ace.instance.AceSerialManager')
+    def test_heartbeat_failures_soft_reset_before_hard_reconnect(self, mock_serial_mgr_class):
+        """The first status_failure_threshold failures should try
+        soft_reset() (no USB operation) before ever calling reconnect()
+        (close()/open() - the operation independently confirmed able to
+        crash this Pi's USB controller)."""
+        ace_config = dict(self.ace_config)
+        ace_config['status_failure_threshold'] = 2
+        instance = AceInstance(0, ace_config, self.mock_printer)
+        instance.serial_mgr.MAX_SOFT_RESETS_BEFORE_HARD = 2
+        instance.serial_mgr.soft_reset = Mock(return_value=True)
+
+        instance._on_heartbeat_response(None)
+        instance._on_heartbeat_response(None)  # hits threshold -> soft reset #1
+
+        instance.serial_mgr.soft_reset.assert_called_once()
+        instance.serial_mgr.reconnect.assert_not_called()
+        self.assertEqual(instance._consecutive_soft_resets, 1)
+        self.assertEqual(instance._status_failure_streak, 0)
+
+    @patch('ace.instance.AceSerialManager')
+    def test_heartbeat_failures_escalate_to_reconnect_after_max_soft_resets(self, mock_serial_mgr_class):
+        """Once soft resets in a row have already been tried the maximum
+        number of times, the next threshold-hit must escalate to a real
+        reconnect() instead of soft-resetting forever."""
+        ace_config = dict(self.ace_config)
+        ace_config['status_failure_threshold'] = 2
+        instance = AceInstance(0, ace_config, self.mock_printer)
+        instance.serial_mgr.MAX_SOFT_RESETS_BEFORE_HARD = 1
+        instance.serial_mgr.soft_reset = Mock(return_value=True)
+        instance._consecutive_soft_resets = 1  # already used up the one allowed
+
+        instance._on_heartbeat_response(None)
+        instance._on_heartbeat_response(None)  # hits threshold again
+
+        instance.serial_mgr.soft_reset.assert_not_called()
+        instance.serial_mgr.reconnect.assert_called_once_with()
+        self.assertEqual(instance._consecutive_soft_resets, 0)
+
+    @patch('ace.instance.AceSerialManager')
+    def test_heartbeat_failures_escalate_when_soft_reset_cannot_help(self, mock_serial_mgr_class):
+        """soft_reset() returning False (device not enumerated any more)
+        must fall through to a real reconnect(), not silently do nothing."""
+        ace_config = dict(self.ace_config)
+        ace_config['status_failure_threshold'] = 2
+        instance = AceInstance(0, ace_config, self.mock_printer)
+        instance.serial_mgr.MAX_SOFT_RESETS_BEFORE_HARD = 2
+        instance.serial_mgr.soft_reset = Mock(return_value=False)
+
+        instance._on_heartbeat_response(None)
+        instance._on_heartbeat_response(None)
+
+        instance.serial_mgr.soft_reset.assert_called_once()
+        instance.serial_mgr.reconnect.assert_called_once_with()
 
     @patch('ace.instance.AceSerialManager')
     def test_heartbeat_success_resets_failure_tracking(self, mock_serial_mgr_class):
