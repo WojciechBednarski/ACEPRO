@@ -2616,6 +2616,41 @@ class TestGetStatus(unittest.TestCase):
         self.assertIn('target_index', status)
         self.assertEqual(status['target_index'], -1)
 
+    @patch('ace.manager.AceInstance')
+    @patch('ace.manager.EndlessSpool')
+    def test_get_status_includes_toolchange_failed_defaults(self, mock_endless_spool, mock_ace_instance):
+        """get_status() must expose the tool-change-failure fields consumed by
+        the KlipperScreen recovery dialog, defaulting to "no failure".
+        """
+        manager = AceManager(self.mock_config)
+
+        status = manager.get_status()
+
+        self.assertIn('toolchange_failed_active', status)
+        self.assertEqual(status['toolchange_failed_active'], False)
+        self.assertIn('toolchange_failed_tool', status)
+        self.assertEqual(status['toolchange_failed_tool'], -1)
+        self.assertIn('toolchange_failed_error', status)
+        self.assertEqual(status['toolchange_failed_error'], "")
+
+    @patch('ace.manager.AceInstance')
+    @patch('ace.manager.EndlessSpool')
+    def test_get_status_includes_filament_pos(self, mock_endless_spool, mock_ace_instance):
+        """get_status() must expose filament_pos, defaulting to 'bowden' -
+        the web dashboard shows this before offering ACE_DEBUG_SET_FILAMENT_STATE
+        as a confirmation-gated override.
+        """
+        from ace.config import FILAMENT_STATE_BOWDEN, FILAMENT_STATE_NOZZLE
+
+        manager = AceManager(self.mock_config)
+
+        status = manager.get_status()
+        self.assertEqual(status['filament_pos'], FILAMENT_STATE_BOWDEN)
+
+        manager.state.set_and_save("ace_filament_pos", FILAMENT_STATE_NOZZLE)
+        status = manager.get_status()
+        self.assertEqual(status['filament_pos'], FILAMENT_STATE_NOZZLE)
+
 
 class TestPerformToolChange(unittest.TestCase):
     """Test perform_tool_change functionality with comprehensive branch coverage."""

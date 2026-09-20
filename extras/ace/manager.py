@@ -3133,6 +3133,22 @@ class AceManager:
                 "ace_pro_enabled": bool(self._ace_pro_enabled),
                 "toolhead_sensor": toolhead_sensor,
                 "rdm_sensor": rdm_sensor,
+                "toolchange_failed_active": bool(
+                    self.state.get("ace_toolchange_failed_active", False)
+                ),
+                "toolchange_failed_tool": int(
+                    self.state.get("ace_toolchange_failed_tool", -1)
+                ),
+                "toolchange_failed_error": str(
+                    self.state.get("ace_toolchange_failed_error", "")
+                ),
+                # Read-only visibility for the web dashboard's state-override
+                # confirmation dialogs (ACE_DEBUG_SET_CURRENT_INDEX/_TARGET_INDEX/
+                # _FILAMENT_STATE) - shows what a manual override would be
+                # changing before it's applied.
+                "filament_pos": self.state.get(
+                    "ace_filament_pos", FILAMENT_STATE_BOWDEN
+                ),
             }
         except Exception:
             return {
@@ -3144,6 +3160,10 @@ class AceManager:
                 "ace_pro_enabled": False,
                 "toolhead_sensor": None,
                 "rdm_sensor": None,
+                "toolchange_failed_active": False,
+                "toolchange_failed_tool": -1,
+                "toolchange_failed_error": "",
+                "filament_pos": FILAMENT_STATE_BOWDEN,
             }
 
     def _resolve_instance_config(self, instance_num):

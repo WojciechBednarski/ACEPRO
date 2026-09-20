@@ -2157,6 +2157,21 @@ class TestAceSetRetractSpeed:
             ace.commands.cmd_ACE_SET_RETRACT_SPEED(mock_gcmd)
 
 
+class TestAceClearToolchangeFailure:
+    """ACE_CLEAR_TOOLCHANGE_FAILURE: called from RESUME/CANCEL_PRINT for the
+    cases cmd_ACE_CHANGE_TOOL itself can't cover (no toolchange attempted).
+    """
+
+    def test_clears_the_flag(self, mock_gcmd, setup_mocks):
+        ace.commands.cmd_ACE_CLEAR_TOOLCHANGE_FAILURE(mock_gcmd)
+        INSTANCE_MANAGERS[0].state.set.assert_any_call("ace_toolchange_failed_active", False)
+
+    def test_swallows_errors(self, mock_gcmd, setup_mocks):
+        INSTANCE_MANAGERS[0].state.set = Mock(side_effect=RuntimeError("boom"))
+        ace.commands.cmd_ACE_CLEAR_TOOLCHANGE_FAILURE(mock_gcmd)
+        assert mock_gcmd.respond_info.called
+
+
 class TestToolChangeIntegration:
     """Integration tests for ACE_CHANGE_TOOL - the most critical business logic."""
 
@@ -2314,6 +2329,34 @@ class TestToolChangeIntegration:
             # Verify Resume and Cancel buttons were added
             assert any("Resume|RESUME" in c for c in calls)
             assert any("Cancel Print|CANCEL_PRINT" in c for c in calls)
+
+            # Verify the failure is mirrored into ace_state for richer clients
+            # (e.g. the KlipperScreen ACE panel's recovery dialog)
+            INSTANCE_MANAGERS[0].state.set.assert_any_call("ace_toolchange_failed_active", True)
+            INSTANCE_MANAGERS[0].state.set.assert_any_call("ace_toolchange_failed_tool", 1)
+            INSTANCE_MANAGERS[0].state.set.assert_any_call("ace_toolchange_failed_error", "Sensor blocked")
+
+    def test_cmd_ACE_CHANGE_TOOL_clears_stale_failure_flag_on_new_attempt(self, mock_gcmd, setup_mocks):
+        """Every new toolchange attempt (Retry/RESUME/T<n>) must clear a stale
+        failure flag from a previous attempt up front, so a successful retry
+        doesn't leave the KlipperScreen recovery dialog showing a stale error.
+        """
+        mock_gcmd.get_int = Mock(return_value=1)
+        INSTANCE_MANAGERS[0].perform_tool_change = Mock(return_value="Success")
+        INSTANCE_MANAGERS[0].state.get = Mock(return_value=0)
+
+        mock_printer = Mock()
+        mock_toolhead = Mock()
+        mock_kinematics = Mock(get_status=Mock(return_value={'homed_axes': 'xyz'}))
+        mock_toolhead.get_kinematics = Mock(return_value=mock_kinematics)
+        mock_reactor = Mock(monotonic=Mock(return_value=1.0))
+        mock_printer.get_reactor = Mock(return_value=mock_reactor)
+        mock_printer.lookup_object = Mock(return_value=Mock())
+
+        with patch('ace.commands.get_printer', return_value=mock_printer):
+            ace.commands.cmd_ACE_CHANGE_TOOL(INSTANCE_MANAGERS[0], mock_gcmd, 1)
+
+        INSTANCE_MANAGERS[0].state.set.assert_any_call("ace_toolchange_failed_active", False)
 
     def test_cmd_ACE_CHANGE_TOOL_failure_not_printing_keeps_current_tool_and_turns_off_heater(self, mock_gcmd, setup_mocks):
         """Test idle/startup failure keeps current tool state and turns off heater."""
@@ -2538,9 +2581,13 @@ class TestToolChangeIntegration:
         with patch('ace.commands.get_printer', return_value=mock_printer):
             ace.commands.cmd_ACE_CHANGE_TOOL(INSTANCE_MANAGERS[0], mock_gcmd, 2)
             
-            # Verify state was updated to tool 2 even though it failed
+            # Verify state was updated to tool 2 even though it failed.
+            # assert_any_call (not assert_called_with): ace_current_index is
+            # no longer necessarily the LAST state.set() call - the
+            # ace_toolchange_failed_* mirroring for the KlipperScreen recovery
+            # dialog is set afterwards, while building the retry prompt.
             assert INSTANCE_MANAGERS[0].state.set.called
-            INSTANCE_MANAGERS[0].state.set.assert_called_with("ace_current_index", 2)
+            INSTANCE_MANAGERS[0].state.set.assert_any_call("ace_current_index", 2)
             
             # Verify SET_GCODE_VARIABLE was called
             assert mock_gcode.run_script_from_command.called

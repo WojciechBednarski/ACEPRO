@@ -2504,6 +2504,18 @@ class AceInstance:
         # Expose communication state machine for KlipperScreen connection indicator
         status["connection_state"] = getattr(self.serial_mgr, "connection_state", "unknown")
 
+        # A couple of ACE_GET_CONNECTION_STATUS's richer fields, for clients
+        # (web dashboard) that want more than the plain connection_state
+        # string - e.g. distinguishing "just reconnected, still settling"
+        # from a genuinely stable link.
+        try:
+            conn_status = self.serial_mgr.get_connection_status()
+            status["connection_stable"] = conn_status.get("stable")
+            status["connection_recent_reconnects"] = conn_status.get("recent_reconnects")
+        except Exception:
+            status["connection_stable"] = None
+            status["connection_recent_reconnects"] = None
+
         return status
 
     def dwell(self, delay=1.0, verbose=False):

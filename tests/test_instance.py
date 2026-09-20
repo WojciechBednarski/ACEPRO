@@ -3441,6 +3441,35 @@ class TestGetStatus(unittest.TestCase):
         # Check slots structure
         self.assertEqual(len(status['slots']), SLOTS_PER_ACE)
 
+    @patch('ace.instance.AceSerialManager')
+    def test_get_status_includes_connection_detail(self, mock_serial_mgr_class):
+        """get_status() must surface stable/recent_reconnects from
+        serial_mgr.get_connection_status() for clients (web dashboard) that
+        want more than the plain connection_state string.
+        """
+        instance = AceInstance(0, self.ace_config, self.mock_printer)
+        instance.serial_mgr.get_connection_status = Mock(
+            return_value={"stable": True, "recent_reconnects": 2}
+        )
+
+        status = instance.get_status()
+
+        self.assertEqual(status['connection_stable'], True)
+        self.assertEqual(status['connection_recent_reconnects'], 2)
+
+    @patch('ace.instance.AceSerialManager')
+    def test_get_status_connection_detail_defaults_to_none_on_error(self, mock_serial_mgr_class):
+        """A broken/mocked serial_mgr must not blow up get_status() - the
+        connection detail fields just fall back to None.
+        """
+        instance = AceInstance(0, self.ace_config, self.mock_printer)
+        instance.serial_mgr.get_connection_status = Mock(side_effect=RuntimeError("boom"))
+
+        status = instance.get_status()
+
+        self.assertIsNone(status['connection_stable'])
+        self.assertIsNone(status['connection_recent_reconnects'])
+
 class TestInventoryJsonEmission(unittest.TestCase):
     """Test JSON emission of inventory data for UI/KlipperScreen."""
     

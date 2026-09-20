@@ -137,6 +137,32 @@ Consumers:
   signals a pending resume/retry that must not have its fallback tool state
   overwritten.
 
+**Tool-Change-Failed Recovery State (`ace_toolchange_failed_active` / `_tool` / `_error`):**
+Mirrors a mid-print toolchange failure into persistent state so richer clients
+can build their own recovery UI, in addition to the plain Klipper
+`action:prompt_*` buttons (which stay unchanged as the lowest-common-denominator
+UI for Mainsail/Fluidd/other clients). Set only on the same `is_printing and not
+is_startup` branch that shows the retry prompt (`cmd_ACE_CHANGE_TOOL`'s exception
+handler in `commands.py`):
+
+- `ace_toolchange_failed_active` (bool): a failure prompt is currently open.
+- `ace_toolchange_failed_tool` (int): the `T<n>` that failed.
+- `ace_toolchange_failed_error` (str): first line of the exception text.
+
+Cleared unconditionally at the very top of `cmd_ACE_CHANGE_TOOL`, i.e. at the
+start of every new attempt (Retry button, RESUME's tool reload, or a plain
+`T<n>`) - so a successful retry can never leave a stale failure displayed, and
+a repeat failure re-sets it with fresh details.
+
+Consumers:
+- `get_status()`: exposes all three as `toolchange_failed_active` / `_tool` / `_error`.
+- KlipperScreen (`acepro.py`): `_handle_toolchange_failed_state()` shows a
+  custom `Gtk.Dialog` (sliders for toolhead-extruder and ACE-motor
+  extrude/retract, a tool picker, feed-assist toggle, live sensor status)
+  whenever the flag is set and `print_stats` is `"paused"`; auto-dismisses it
+  if the flag clears without the user using that dialog (e.g. resumed from
+  Mainsail/Fluidd instead).
+
 **Toolchange Guard Decorator:**
 ```python
 @toolchange_in_progress_guard

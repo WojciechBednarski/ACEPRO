@@ -69,8 +69,8 @@ createApp({
                         assistOff: 'Assist OFF'
                     },
                     dialogs: {
-                        feedTitle: 'Feed Filament - Slot {slot}',
-                        retractTitle: 'Retract Filament - Slot {slot}',
+                        feedTitle: 'Feed Filament - T{tool}',
+                        retractTitle: 'Retract Filament - T{tool}',
                         length: 'Length (mm):',
                         speed: 'Speed (mm/s):',
                         execute: 'Execute',
@@ -149,6 +149,8 @@ createApp({
             deviceStatus: {
                 status: 'unknown',
                 connection_state: 'unknown',
+                connection_stable: null,          // true/false/null (unknown)
+                connection_recent_reconnects: null,
                 model: 'Anycubic Color Engine Pro',
                 firmware: 'N/A',
                 boot_firmware: 'N/A',
@@ -159,6 +161,10 @@ createApp({
                 usb_port: '',
                 usb_path: ''
             },
+
+            // Purge amount form (ACE_SET_PURGE_AMOUNT)
+            purgeLength: ACE_DASHBOARD_CONFIG?.defaults?.purgeLength || 40,
+            purgeSpeed: ACE_DASHBOARD_CONFIG?.defaults?.purgeSpeed || 400,
             
             // Dryer
             dryerStatus: {
@@ -201,16 +207,66 @@ createApp({
             rfidSyncEnabled: false,
             editingHex: {},
             
-            // Modals
-            showFeedModal: false,
-            showRetractModal: false,
-            feedSlot: 0,
+            // Manage Slot modal - consolidates everything that isn't a
+            // one-tap action (Feed/Retract/Stop, Spoolman, Full Unload)
+            // behind a single "Manage..." button per slot card, instead of
+            // stacking ~10 buttons on every card.
+            showManageModal: false,
+            manageOverlayMouseDownOnSelf: false, // guards against a drag that starts
+                                                  // inside the modal (e.g. selecting
+                                                  // text in a field) and releases over
+                                                  // the backdrop from closing the modal
+            manageTool: -1,
+            manageSku: '',
+            manageSpoolmanId: 0,
             feedLength: ACE_DASHBOARD_CONFIG?.defaults?.feedLength || 50,
             feedSpeed: ACE_DASHBOARD_CONFIG?.defaults?.feedSpeed || 25,
-            retractSlot: 0,
             retractLength: ACE_DASHBOARD_CONFIG?.defaults?.retractLength || 50,
             retractSpeed: ACE_DASHBOARD_CONFIG?.defaults?.retractSpeed || 25,
-            
+
+            // Spoolman integration (config/spoolman_logic.cfg) - shown in the
+            // Manage Slot modal. Set enableSpoolman: false in
+            // ace-dashboard-config.js for setups that don't use Spoolman.
+            spoolmanEnabled: ACE_DASHBOARD_CONFIG?.enableSpoolman !== false,
+
+            // Tool-Change-Failed recovery
+            // Backend flow: ace.commands.cmd_ACE_CHANGE_TOOL mirrors a mid-print
+            // toolchange failure into ace_state (toolchange_failed_active/_tool/_error),
+            // in addition to (not instead of) the plain Klipper action:prompt_*
+            // buttons. This dashboard shows a richer modal for it.
+            toolchangeFailedActive: false,
+            toolchangeFailedTool: -1,
+            toolchangeFailedError: '',
+            toolheadSensor: null,  // true/false when known, null = sensor not configured
+            rdmSensor: null,       // true/false when known, null = sensor not configured
+            showTcfModal: false,
+            tcfSelectedTool: -1,
+            tcfExtrudeLength: ACE_DASHBOARD_CONFIG?.defaults?.tcfExtrudeLength || 100,
+            tcfExtrudeSpeed: ACE_DASHBOARD_CONFIG?.defaults?.tcfExtrudeSpeed || 300,
+            tcfAceLength: ACE_DASHBOARD_CONFIG?.defaults?.tcfAceLength || 100,
+            tcfAceSpeed: ACE_DASHBOARD_CONFIG?.defaults?.tcfAceSpeed || 40,
+
+            // Instance-wide controls
+            endlessSpoolEnabled: false,
+            endlessSpoolMatchMode: 'exact',
+            filamentPos: 'bowden',
+
+            // Advanced: raw state override (ACE_DEBUG_SET_CURRENT_INDEX/
+            // _TARGET_INDEX/_FILAMENT_STATE). These only edit the saved
+            // belief about what's loaded/in-flight/where the filament tip
+            // is - they never physically move anything - so a wrong value
+            // desyncs tracking from reality and can jam the next toolchange.
+            // Hidden by default; every action goes through the shared
+            // confirm modal, which always shows the current value first.
+            showAdvanced: false,
+            overrideCurrentIndexInput: -1,
+            overrideTargetIndexInput: -1,
+            overrideFilamentStateInput: 'bowden',
+            showOverrideConfirm: false,
+            overrideConfirmTitle: '',
+            overrideConfirmDetail: '',
+            overrideConfirmAction: null,
+
             // Notifications
             notification: {
                 show: false,
@@ -381,6 +437,26 @@ createApp({
                         if (typeof aceData.rfid_sync_enabled === 'boolean') {
                             globalUpdate.rfid_sync_enabled = aceData.rfid_sync_enabled;
                         }
+                        if (aceData.toolhead_sensor !== undefined) {
+                            globalUpdate.toolhead_sensor = aceData.toolhead_sensor;
+                        }
+                        if (aceData.rdm_sensor !== undefined) {
+                            globalUpdate.rdm_sensor = aceData.rdm_sensor;
+                        }
+                        if (aceData.toolchange_failed_active !== undefined) {
+                            globalUpdate.toolchange_failed_active = aceData.toolchange_failed_active;
+                            globalUpdate.toolchange_failed_tool = aceData.toolchange_failed_tool;
+                            globalUpdate.toolchange_failed_error = aceData.toolchange_failed_error;
+                        }
+                        if (typeof aceData.endless_spool_enabled === 'boolean') {
+                            globalUpdate.endless_spool_enabled = aceData.endless_spool_enabled;
+                        }
+                        if (typeof aceData.endless_spool_match_mode === 'string') {
+                            globalUpdate.endless_spool_match_mode = aceData.endless_spool_match_mode;
+                        }
+                        if (typeof aceData.filament_pos === 'string') {
+                            globalUpdate.filament_pos = aceData.filament_pos;
+                        }
                         if (Object.keys(globalUpdate).length > 0) {
                             this.updateStatus(globalUpdate);
                         }
@@ -496,7 +572,46 @@ createApp({
             if (typeof data.rfid_sync_enabled === 'boolean') {
                 this.rfidSyncEnabled = data.rfid_sync_enabled;
             }
-            
+
+            // Sensor states + tool-change-failure recovery flag. Accept both
+            // top-level (websocket push, see handleWebSocketMessage's
+            // globalUpdate) and nested ace_manager.* (REST poll response).
+            const mgrData = (data.ace_manager && typeof data.ace_manager === 'object') ? data.ace_manager : {};
+            if ('toolhead_sensor' in data) {
+                this.toolheadSensor = data.toolhead_sensor;
+            } else if ('toolhead_sensor' in mgrData) {
+                this.toolheadSensor = mgrData.toolhead_sensor;
+            }
+            if ('rdm_sensor' in data) {
+                this.rdmSensor = data.rdm_sensor;
+            } else if ('rdm_sensor' in mgrData) {
+                this.rdmSensor = mgrData.rdm_sensor;
+            }
+            const tcf = ('toolchange_failed_active' in data) ? data
+                : (('toolchange_failed_active' in mgrData) ? mgrData : null);
+            if (tcf) {
+                this.toolchangeFailedTool = Number.isInteger(tcf.toolchange_failed_tool) ? tcf.toolchange_failed_tool : -1;
+                this.toolchangeFailedError = typeof tcf.toolchange_failed_error === 'string' ? tcf.toolchange_failed_error : '';
+                this.setToolchangeFailedActive(!!tcf.toolchange_failed_active);
+            }
+
+            // Endless spool (manager-wide, not per-instance).
+            if (typeof data.endless_spool_enabled === 'boolean') {
+                this.endlessSpoolEnabled = data.endless_spool_enabled;
+            } else if (typeof mgrData.endless_spool_enabled === 'boolean') {
+                this.endlessSpoolEnabled = mgrData.endless_spool_enabled;
+            }
+            if (typeof data.endless_spool_match_mode === 'string') {
+                this.endlessSpoolMatchMode = data.endless_spool_match_mode;
+            } else if (typeof mgrData.endless_spool_match_mode === 'string') {
+                this.endlessSpoolMatchMode = mgrData.endless_spool_match_mode;
+            }
+            if (typeof data.filament_pos === 'string') {
+                this.filamentPos = data.filament_pos;
+            } else if (typeof mgrData.filament_pos === 'string') {
+                this.filamentPos = mgrData.filament_pos;
+            }
+
             if (ACE_DASHBOARD_CONFIG?.debug) {
                 console.log('Updating status with data:', data);
             }
@@ -523,6 +638,12 @@ createApp({
             }
             if (data.connection_state !== undefined) {
                 this.deviceStatus.connection_state = data.connection_state || 'unknown';
+            }
+            if ('connection_stable' in data) {
+                this.deviceStatus.connection_stable = data.connection_stable;
+            }
+            if ('connection_recent_reconnects' in data) {
+                this.deviceStatus.connection_recent_reconnects = data.connection_recent_reconnects;
             }
             if (data.model !== undefined) {
                 this.deviceStatus.model = data.model;
@@ -617,7 +738,12 @@ createApp({
                                 ? this.getPreviousHex(prevPanel, slot.index) || this.getColorHex(slot.color)
                                 : this.getColorHex(slot.color),
                             sku: slot.sku || '',
-                            rfid: slot.rfid !== undefined ? slot.rfid : 0
+                            rfid: slot.rfid !== undefined ? slot.rfid : 0,
+                            // Local-only scratch field (Spoolman ID typed but not yet
+                            // submitted via Map SKU / Set Slot) - not part of ACE's own
+                            // status, so carry it forward across refreshes instead of
+                            // resetting it every poll cycle.
+                            spoolmanId: prevPanel?.slots?.find(s => s.index === slot.index)?.spoolmanId ?? 0
                         })),
                         feedAssistSlot: typeof item.feed_assist_slot === 'number' ? item.feed_assist_slot : -1,
                         rfidSyncEnabled: typeof item.rfid_sync_enabled === 'boolean' ? item.rfid_sync_enabled : this.rfidSyncEnabled
@@ -642,7 +768,8 @@ createApp({
                             : this.getColorHex(slot.color),
                         temp: typeof slot.temp === 'number' ? slot.temp : 0,
                         sku: slot.sku || '',
-                        rfid: slot.rfid !== undefined ? slot.rfid : 0
+                        rfid: slot.rfid !== undefined ? slot.rfid : 0,
+                        spoolmanId: this.slots.find(s => s.index === slot.index)?.spoolmanId ?? 0
                     }));
                 } else {
                     console.warn('Slots data is not an array:', data.slots);
@@ -785,7 +912,198 @@ createApp({
                 this.showNotification(this.t('notifications.commandErrorGeneric'), 'error');
             }
         },
-        
+
+        // Connection
+        async reconnectInstance() {
+            const success = await this.executeCommand('ACE_RECONNECT', { INSTANCE: this.selectedInstance });
+            if (success) {
+                this.showNotification(`Reconnecting ACE ${this.selectedInstance}...`, 1);
+            }
+        },
+
+        // Recovers an instance stuck on the wrong protocol after an
+        // incomplete startup USB scan - safe to run any time, it only adopts
+        // a unit once ACE2 discovery proves it's actually there unbound.
+        async redetectInstance() {
+            const success = await this.executeCommand('ACE_REDETECT', { INSTANCE: this.selectedInstance });
+            if (success) {
+                this.showNotification(`Re-detecting ACE ${this.selectedInstance}...`, 1);
+            }
+        },
+
+        async setPurgeAmount() {
+            if (!(this.purgeLength > 0)) {
+                this.showNotification('Enter a valid purge length', 'error');
+                return;
+            }
+            const success = await this.executeCommand('ACE_SET_PURGE_AMOUNT', {
+                PURGELENGTH: this.purgeLength,
+                PURGESPEED: this.purgeSpeed,
+                INSTANCE: this.selectedInstance
+            });
+            if (success) {
+                this.showNotification(`Purge set: ${this.purgeLength}mm @ ${this.purgeSpeed}mm/min`, 'success');
+            }
+        },
+
+        // Persists any pending save_variables changes (Spoolman mappings,
+        // slot edits, ...) to disk immediately instead of waiting for the
+        // next natural flush point (print end, disconnect).
+        async flushToDisk() {
+            const success = await this.executeCommand('ACE_FLUSH');
+            if (success) {
+                this.showNotification('Pending changes flushed to disk', 'success');
+            }
+        },
+
+        // Advanced: raw state override
+        // ACE_DEBUG_SET_CURRENT_INDEX/_TARGET_INDEX/_FILAMENT_STATE only edit
+        // the saved belief about the system's state - they never physically
+        // move filament. A wrong value desyncs tracking from reality and can
+        // jam the next toolchange, so every action here is routed through a
+        // shared confirmation modal that always shows the current value.
+        toolLabel(tool) {
+            return Number.isInteger(tool) && tool >= 0 ? `T${tool}` : 'none';
+        },
+
+        requestOverrideConfirm(title, detail, action) {
+            this.overrideConfirmTitle = title;
+            this.overrideConfirmDetail = detail;
+            this.overrideConfirmAction = action;
+            this.showOverrideConfirm = true;
+        },
+
+        cancelOverrideConfirm() {
+            this.showOverrideConfirm = false;
+            this.overrideConfirmAction = null;
+        },
+
+        async confirmOverride() {
+            const action = this.overrideConfirmAction;
+            this.showOverrideConfirm = false;
+            this.overrideConfirmAction = null;
+            if (action) {
+                await action();
+            }
+        },
+
+        requestOverrideCurrentIndex() {
+            const tool = Number(this.overrideCurrentIndexInput);
+            this.requestOverrideConfirm(
+                'Override Current Tool',
+                `Current tool is recorded as ${this.toolLabel(this.currentTool)}. This will force it to `
+                + `${this.toolLabel(tool)} WITHOUT moving any filament, and also clears the in-flight `
+                + `toolchange target. Only do this after you've manually confirmed what's actually loaded - `
+                + `a wrong value can jam the next toolchange.`,
+                async () => {
+                    const success = await this.executeCommand('ACE_DEBUG_SET_CURRENT_INDEX', { TOOL: tool });
+                    if (success) {
+                        this.currentTool = tool;
+                        this.showNotification(`Current tool overridden to ${this.toolLabel(tool)}`, 'success');
+                    }
+                }
+            );
+        },
+
+        requestOverrideTargetIndex() {
+            const tool = Number(this.overrideTargetIndexInput);
+            this.requestOverrideConfirm(
+                'Override In-Flight Toolchange Target',
+                `Target (unconfirmed toolchange) is recorded as ${this.toolLabel(this.targetTool)}. This will `
+                + `force it to ${this.toolLabel(tool)} WITHOUT moving any filament. Only do this after you've `
+                + `manually confirmed the real state - a wrong value can make RESUME reload the wrong tool.`,
+                async () => {
+                    const success = await this.executeCommand('ACE_DEBUG_SET_TARGET_INDEX', { TOOL: tool });
+                    if (success) {
+                        this.targetTool = tool;
+                        this.showNotification(`Target tool overridden to ${this.toolLabel(tool)}`, 'success');
+                    }
+                }
+            );
+        },
+
+        requestOverrideFilamentState() {
+            const state = this.overrideFilamentStateInput;
+            this.requestOverrideConfirm(
+                'Override Filament Position',
+                `Filament position is recorded as "${this.filamentPos}". This will force it to "${state}" `
+                + `WITHOUT moving any filament. Only do this after you've physically verified where the `
+                + `filament tip actually is - a wrong value can cause the next feed/retract to jam.`,
+                async () => {
+                    const success = await this.executeCommand('ACE_DEBUG_SET_FILAMENT_STATE', { STATE: state });
+                    if (success) {
+                        this.filamentPos = state;
+                        this.showNotification(`Filament position overridden to "${state}"`, 'success');
+                    }
+                }
+            );
+        },
+
+        // Endless Spool (manager-wide - not scoped to a single instance)
+        async enableEndlessSpool() {
+            const success = await this.executeCommand('ACE_ENABLE_ENDLESS_SPOOL');
+            if (success) {
+                this.endlessSpoolEnabled = true;
+                this.showNotification('Endless spool enabled', 'success');
+            }
+        },
+
+        async disableEndlessSpool() {
+            const success = await this.executeCommand('ACE_DISABLE_ENDLESS_SPOOL');
+            if (success) {
+                this.endlessSpoolEnabled = false;
+                this.showNotification('Endless spool disabled', 'success');
+            }
+        },
+
+        async setEndlessSpoolMode(event) {
+            const mode = event && event.target ? event.target.value : this.endlessSpoolMatchMode;
+            const success = await this.executeCommand('ACE_SET_ENDLESS_SPOOL_MODE', { MODE: mode });
+            if (success) {
+                this.endlessSpoolMatchMode = mode;
+                this.showNotification(`Endless spool match mode: ${mode}`, 'success');
+            }
+        },
+
+        // RFID Sync (per selected instance)
+        async enableRfidSync() {
+            const success = await this.executeCommand('ACE_ENABLE_RFID_SYNC', { INSTANCE: this.selectedInstance });
+            if (success) {
+                this.rfidSyncEnabled = true;
+                this.showNotification('RFID sync enabled', 'success');
+            }
+        },
+
+        async disableRfidSync() {
+            const success = await this.executeCommand('ACE_DISABLE_RFID_SYNC', { INSTANCE: this.selectedInstance });
+            if (success) {
+                this.rfidSyncEnabled = false;
+                this.showNotification('RFID sync disabled', 'success');
+            }
+        },
+
+        // Tangle Detection - fire-and-forget; no live status readout wired up
+        // yet (ACE_TANGLE_DETECTION's current-state query is console text
+        // only, not part of the JSON status payload this dashboard polls).
+        async enableTangleDetection() {
+            await this.executeCommand('ACE_TANGLE_DETECTION', { ENABLE: 1 });
+        },
+
+        async disableTangleDetection() {
+            await this.executeCommand('ACE_TANGLE_DETECTION', { ENABLE: 0 });
+        },
+
+        // Full Unload - retracts a specific slot until empty, regardless of
+        // whether it's the currently loaded tool. Distinct from the regular
+        // Unload button, which only smart-unloads the currently loaded tool.
+        async fullUnload(tool) {
+            if (!Number.isInteger(tool)) {
+                this.showNotification('Could not resolve a tool number for this slot', 'error');
+                return;
+            }
+            await this.executeCommand('ACE_FULL_UNLOAD', { TOOL: tool });
+        },
+
         // Feed Assist Actions
         async toggleFeedAssist(index, instanceIndex) {
             const targetInstance = Number.isInteger(instanceIndex) ? instanceIndex : (this.selectedInstance || 0);
@@ -849,61 +1167,232 @@ createApp({
             await this.executeCommand('ACE_STOP_DRYING', { INSTANCE: this.selectedInstance });
         },
         
-        // Feed/Retract Actions
-        showFeedDialog(slot) {
-            this.feedSlot = slot;
+        // Manage Slot modal
+        // Everything here is addressed by global tool number (T=), not a
+        // local slot INDEX + INSTANCE=, so it works correctly regardless of
+        // which ACE instance is currently selected in the header dropdown -
+        // T= alone resolves instance+slot server side.
+        openManageModal(tool) {
+            if (!Number.isInteger(tool)) {
+                this.showNotification('Could not resolve a tool number for this slot', 'error');
+                return;
+            }
+            this.manageTool = tool;
+            const found = this.findPanelAndSlotForTool(tool);
+            this.manageSku = found ? (found.slot.sku || '') : '';
+            this.manageSpoolmanId = found ? (found.slot.spoolmanId || 0) : 0;
             this.feedLength = ACE_DASHBOARD_CONFIG?.defaults?.feedLength || 50;
             this.feedSpeed = ACE_DASHBOARD_CONFIG?.defaults?.feedSpeed || 25;
-            this.showFeedModal = true;
+            this.retractLength = ACE_DASHBOARD_CONFIG?.defaults?.retractLength || 50;
+            this.retractSpeed = ACE_DASHBOARD_CONFIG?.defaults?.retractSpeed || 25;
+            this.showManageModal = true;
         },
-        
-        closeFeedDialog() {
-            this.showFeedModal = false;
+
+        closeManageModal() {
+            this.showManageModal = false;
         },
-        
-        async executeFeed() {
+
+        // Only close when both the mousedown AND the click landed on the
+        // backdrop itself - a click/drag that starts inside the modal (e.g.
+        // selecting text in a number field) and releases outside it would
+        // otherwise still fire a "click" on the overlay and close the modal.
+        onManageOverlayClick(event) {
+            if (this.manageOverlayMouseDownOnSelf && event.target === event.currentTarget) {
+                this.closeManageModal();
+            }
+        },
+
+        async manageFeed() {
             if (this.feedLength < 1) {
                 this.showNotification(this.t('notifications.validation.feedLength'), 'error');
                 return;
             }
-            
-            const success = await this.executeCommand('ACE_FEED', {
-                INDEX: this.feedSlot,
-                LENGTH: this.feedLength,
-                SPEED: this.feedSpeed
-            });
-            
-            if (success) {
-                this.closeFeedDialog();
-            }
+            await this.executeCommand('ACE_FEED', { T: this.manageTool, LENGTH: this.feedLength, SPEED: this.feedSpeed });
         },
-        
-        showRetractDialog(slot) {
-            this.retractSlot = slot;
-            this.retractLength = ACE_DASHBOARD_CONFIG?.defaults?.retractLength || 50;
-            this.retractSpeed = ACE_DASHBOARD_CONFIG?.defaults?.retractSpeed || 25;
-            this.showRetractModal = true;
+
+        async manageStopFeed() {
+            await this.executeCommand('ACE_STOP_FEED', { T: this.manageTool });
         },
-        
-        closeRetractDialog() {
-            this.showRetractModal = false;
-        },
-        
-        async executeRetract() {
+
+        async manageRetract() {
             if (this.retractLength < 1) {
                 this.showNotification(this.t('notifications.validation.retractLength'), 'error');
                 return;
             }
-            
-            const success = await this.executeCommand('ACE_RETRACT', {
-                INDEX: this.retractSlot,
-                LENGTH: this.retractLength,
-                SPEED: this.retractSpeed
-            });
-            
-            if (success) {
-                this.closeRetractDialog();
+            await this.executeCommand('ACE_RETRACT', { T: this.manageTool, LENGTH: this.retractLength, SPEED: this.retractSpeed });
+        },
+
+        async manageStopRetract() {
+            await this.executeCommand('ACE_STOP_RETRACT', { T: this.manageTool });
+        },
+
+        // ACE_SET_FEED_SPEED/ACE_SET_RETRACT_SPEED retune the speed of a
+        // feed/retract that is CURRENTLY IN PROGRESS on this slot (see
+        // AceInstance._change_feed_speed/_change_retract_speed - "update
+        // active speed while the command is running"). They are not a
+        // persisted default: they do nothing (or the firmware just ignores
+        // them) if nothing is running, and there is nothing to read back
+        // later - that's why this used to appear to "forget" the value.
+        // Only useful for a longer Feed/Retract you want to slow down or
+        // speed up before it finishes.
+        async manageAdjustFeedSpeed() {
+            if (!(this.feedSpeed > 0)) {
+                this.showNotification('Enter a valid speed first', 'error');
+                return;
             }
+            const success = await this.executeCommand('ACE_SET_FEED_SPEED', { T: this.manageTool, SPEED: this.feedSpeed });
+            if (success) {
+                this.showNotification(`Feed speed adjusted to ${this.feedSpeed}mm/s (only affects a feed in progress)`, 'success');
+            }
+        },
+
+        async manageAdjustRetractSpeed() {
+            if (!(this.retractSpeed > 0)) {
+                this.showNotification('Enter a valid speed first', 'error');
+                return;
+            }
+            const success = await this.executeCommand('ACE_SET_RETRACT_SPEED', { T: this.manageTool, SPEED: this.retractSpeed });
+            if (success) {
+                this.showNotification(`Retract speed adjusted to ${this.retractSpeed}mm/s (only affects a retract in progress)`, 'success');
+            }
+        },
+
+        // Spoolman Integration (config/spoolman_logic.cfg macros)
+        async manageMapSku() {
+            if (!this.manageSku) {
+                this.showNotification('This slot has no SKU to map', 'error');
+                return;
+            }
+            const id = Number(this.manageSpoolmanId);
+            if (!Number.isInteger(id) || id <= 0) {
+                this.showNotification('Enter a valid Spoolman ID first', 'error');
+                return;
+            }
+            await this.executeCommand('MAP_SKU', { SKU: this.manageSku, ID: id });
+        },
+
+        async manageSetManualSlot() {
+            const id = Number(this.manageSpoolmanId);
+            if (!Number.isInteger(id) || id <= 0) {
+                this.showNotification('Enter a valid Spoolman ID first', 'error');
+                return;
+            }
+            await this.executeCommand('SPOOLMAN_MANUAL_SLOT', { SLOT: this.manageTool, ID: id });
+        },
+
+        async manageFullUnload() {
+            await this.fullUnload(this.manageTool);
+            this.closeManageModal();
+        },
+
+        // Tool-Change-Failed Recovery Dialog
+        // See ace.commands.cmd_ACE_CHANGE_TOOL / ARCHITECTURE.md for the
+        // backend side of ace_toolchange_failed_active/_tool/_error.
+        setToolchangeFailedActive(active) {
+            this.toolchangeFailedActive = active;
+            if (active) {
+                if (!this.showTcfModal) {
+                    this.tcfSelectedTool = this.toolchangeFailedTool >= 0
+                        ? this.toolchangeFailedTool
+                        : Math.max(this.currentTool, 0);
+                }
+                this.showTcfModal = true;
+            } else {
+                this.showTcfModal = false;
+            }
+        },
+
+        tcfAllTools() {
+            const tools = [];
+            for (const panel of this.instancesPanels) {
+                if (!Array.isArray(panel.slots)) continue;
+                for (const slot of panel.slots) {
+                    const tool = this.getSlotToolNumber(slot, panel.index);
+                    if (Number.isInteger(tool)) tools.push(tool);
+                }
+            }
+            return tools.sort((a, b) => a - b);
+        },
+
+        findPanelAndSlotForTool(tool) {
+            for (const panel of this.instancesPanels) {
+                if (!Array.isArray(panel.slots)) continue;
+                const slot = panel.slots.find(s => this.getSlotToolNumber(s, panel.index) === tool);
+                if (slot) return { panel, slot };
+            }
+            return null;
+        },
+
+        tcfFeedAssistOnFor(tool) {
+            if (!Number.isInteger(tool) || tool < 0) return false;
+            const found = this.findPanelAndSlotForTool(tool);
+            if (!found) return false;
+            return found.panel.feedAssistSlot === found.slot.index;
+        },
+
+        sensorText(value) {
+            if (value === null || value === undefined) return 'Not configured';
+            return value ? 'Present' : 'Clear';
+        },
+
+        sensorClass(value) {
+            if (value === null || value === undefined) return 'unknown';
+            return value ? 'present' : 'clear';
+        },
+
+        async tcfExtruderExtrude() {
+            await this.executeCommand('_EXTRUDE', { LENGTH: this.tcfExtrudeLength, SPEED: this.tcfExtrudeSpeed });
+        },
+
+        async tcfExtruderRetract() {
+            await this.executeCommand('_RETRACT', { LENGTH: this.tcfExtrudeLength, SPEED: this.tcfExtrudeSpeed });
+        },
+
+        async tcfAceFeed() {
+            if (!Number.isInteger(this.tcfSelectedTool) || this.tcfSelectedTool < 0) {
+                this.showNotification('Select a tool first', 'error');
+                return;
+            }
+            await this.executeCommand('ACE_FEED', { T: this.tcfSelectedTool, LENGTH: this.tcfAceLength, SPEED: this.tcfAceSpeed });
+        },
+
+        async tcfAceRetract() {
+            if (!Number.isInteger(this.tcfSelectedTool) || this.tcfSelectedTool < 0) {
+                this.showNotification('Select a tool first', 'error');
+                return;
+            }
+            await this.executeCommand('ACE_RETRACT', { T: this.tcfSelectedTool, LENGTH: this.tcfAceLength, SPEED: this.tcfAceSpeed });
+        },
+
+        async tcfEnableFeedAssist() {
+            if (!Number.isInteger(this.tcfSelectedTool) || this.tcfSelectedTool < 0) return;
+            const success = await this.executeCommand('ACE_ENABLE_FEED_ASSIST', { T: this.tcfSelectedTool });
+            if (success) setTimeout(() => this.loadStatus(), 500);
+        },
+
+        async tcfDisableFeedAssist() {
+            if (!Number.isInteger(this.tcfSelectedTool) || this.tcfSelectedTool < 0) return;
+            const success = await this.executeCommand('ACE_DISABLE_FEED_ASSIST', { T: this.tcfSelectedTool });
+            if (success) setTimeout(() => this.loadStatus(), 500);
+        },
+
+        async tcfRetry() {
+            if (!Number.isInteger(this.tcfSelectedTool) || this.tcfSelectedTool < 0) {
+                this.showNotification('Select a tool first', 'error');
+                return;
+            }
+            this.showTcfModal = false;
+            await this.executeCommand('ACE_CHANGE_TOOL', { TOOL: this.tcfSelectedTool });
+        },
+
+        async tcfResume() {
+            this.showTcfModal = false;
+            await this.executeCommand('RESUME');
+        },
+
+        async tcfCancelPrint() {
+            this.showTcfModal = false;
+            await this.executeCommand('CANCEL_PRINT');
         },
         
         async refreshStatus() {

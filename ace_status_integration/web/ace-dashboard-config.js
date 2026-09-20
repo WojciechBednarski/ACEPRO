@@ -28,7 +28,11 @@ const ACE_DASHBOARD_CONFIG = {
     // Включить отладочные сообщения в консоль
     // Установите true для отладки проблем с загрузкой статуса
     debug: false,
-    
+
+    // Показывать блок Spoolman (Map SKU / Set Slot) на карточках слотов.
+    // Установите false, если Spoolman не используется.
+    enableSpoolman: true,
+
     // Настройки по умолчанию для команд
     defaults: {
         feedLength: 50,      // Длина подачи по умолчанию (мм)
@@ -36,7 +40,15 @@ const ACE_DASHBOARD_CONFIG = {
         retractLength: 50,   // Длина отката по умолчанию (мм)
         retractSpeed: 25,    // Скорость отката по умолчанию (мм/с)
         dryingTemp: 50,      // Температура сушки по умолчанию (°C)
-        dryingDuration: 240  // Длительность сушки по умолчанию (мин)
+        dryingDuration: 240, // Длительность сушки по умолчанию (мин)
+        purgeLength: 40,     // Длина пурги по умолчанию (мм)
+        purgeSpeed: 400,     // Скорость пурги по умолчанию (мм/мин)
+
+        // Tool-Change-Failed recovery dialog
+        tcfExtrudeLength: 100, // Toolhead extruder length (mm)
+        tcfExtrudeSpeed: 300,  // Toolhead extruder speed (mm/min)
+        tcfAceLength: 100,     // ACE motor length (mm)
+        tcfAceSpeed: 40        // ACE motor speed (mm/s)
     }
 };
 

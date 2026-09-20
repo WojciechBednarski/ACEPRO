@@ -1585,6 +1585,13 @@ def cmd_ACE_CHANGE_TOOL(manager, gcmd, tool_index):
         gcmd.respond_info("ACE: Global ACE Pro support disabled - tool change ignored")
         return
 
+    # Clear any stale failure flag from a previous attempt at the start of
+    # every new attempt (a fresh T<n>/Retry, or RESUME reloading the active
+    # tool) - if this attempt also fails it is set again below with fresh
+    # details; if it succeeds the KlipperScreen recovery dialog must not
+    # keep showing the old error.
+    manager.state.set("ace_toolchange_failed_active", False)
+
     printer = get_printer()
 
     if tool_index == -1:
@@ -1743,6 +1750,14 @@ def cmd_ACE_CHANGE_TOOL(manager, gcmd, tool_index):
 
                 error_text = str(e).split('\n')[0].replace('"', '\\"')
                 prompt_text = f"Tool change to T{tool_index} failed! Error: {error_text}"
+
+                # Mirror the failure into ace_state so richer clients (e.g. the
+                # KlipperScreen ACE panel) can show their own recovery dialog
+                # alongside these plain action:prompt buttons. Cleared at the
+                # top of the next toolchange attempt (Retry/RESUME/T<n>).
+                manager.state.set("ace_toolchange_failed_active", True)
+                manager.state.set("ace_toolchange_failed_tool", tool_index)
+                manager.state.set("ace_toolchange_failed_error", error_text)
 
                 gcode.run_script_from_command(
                     f'RESPOND TYPE=command MSG="action:prompt_text {prompt_text}"'
@@ -2135,6 +2150,23 @@ def cmd_ACE_CHANGE_TOOL_WRAPPER(gcmd):
         gcmd.respond_info(f"ACE_CHANGE_TOOL error: {e}")
 
 
+def cmd_ACE_CLEAR_TOOLCHANGE_FAILURE(gcmd):
+    """Clear the ace_toolchange_failed_* recovery-dialog state.
+
+    cmd_ACE_CHANGE_TOOL already clears this at the start of every new
+    toolchange attempt, but RESUME/CANCEL_PRINT don't always trigger one
+    (e.g. RESUME with no tool to reload, or a straight cancel) - called from
+    those macros so richer clients (KlipperScreen, the web dashboard) don't
+    keep showing a stale "Tool Change Failed" dialog for an issue that's
+    already resolved.
+    """
+    try:
+        manager = ace_get_manager(0)
+        manager.state.set("ace_toolchange_failed_active", False)
+    except Exception as e:
+        gcmd.respond_info(f"ACE_CLEAR_TOOLCHANGE_FAILURE error: {e}")
+
+
 def cmd_ACE_FULL_UNLOAD(gcmd):
     """Full unload - retract until slot empty. TOOL=<index> or TOOL=ALL or [no TOOL=current].
 
@@ -2487,6 +2519,8 @@ ACE_COMMANDS = [
      "Set endless spool match mode. MODE=exact|material|next"),
     ("ACE_GET_ENDLESS_SPOOL_MODE", cmd_ACE_GET_ENDLESS_SPOOL_MODE, "Query current match mode"),
     ("ACE_CHANGE_TOOL", cmd_ACE_CHANGE_TOOL_WRAPPER, "Change tool or unload. TOOL=<index> or TOOL=-1"),
+    ("ACE_CLEAR_TOOLCHANGE_FAILURE", cmd_ACE_CLEAR_TOOLCHANGE_FAILURE,
+     "Clear the tool-change-failed recovery state (called from RESUME/CANCEL_PRINT)"),
     ("ACE_SET_RETRACT_SPEED", cmd_ACE_SET_RETRACT_SPEED,
      "Command to update retract speed. T=<tool> or INSTANCE= INDEX=, SPEED="),
     ("ACE_SET_FEED_SPEED", cmd_ACE_SET_FEED_SPEED,

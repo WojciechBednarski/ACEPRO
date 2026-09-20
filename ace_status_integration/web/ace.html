@@ -5,9 +5,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>ACE Control Panel</title>
     <link rel="icon" type="image/svg+xml" href="favicon.svg">
-    <link rel="stylesheet" href="ace-dashboard.css?v=20260308a">
+    <link rel="stylesheet" href="ace-dashboard.css?v=20260919a">
     <script src="vue.global.prod.js?v=3.5.13"></script>
-    <script src="ace-dashboard-config.js?v=20260308b"></script>
+    <script src="ace-dashboard-config.js?v=20260919b"></script>
 </head>
 <body>
     <div id="app">
@@ -119,6 +119,67 @@
                 </div>
             </div>
 
+            <!-- Instance Controls -->
+            <div class="card instance-controls-card">
+                <h2>Instance Controls</h2>
+                <div class="instance-controls-grid">
+                    <div class="control-block">
+                        <span class="control-block-label">Connection</span>
+                        <span class="control-block-state" :class="{ on: deviceStatus.connection_stable === true }" v-if="deviceStatus.connection_stable !== null">
+                            {{ deviceStatus.connection_stable ? 'STABLE' : 'UNSTABLE' }}
+                        </span>
+                        <span
+                            class="control-block-state"
+                            v-if="Number.isInteger(deviceStatus.connection_recent_reconnects) && deviceStatus.connection_recent_reconnects > 0"
+                        >
+                            {{ deviceStatus.connection_recent_reconnects }} reconnect(s)/60s
+                        </span>
+                        <button class="btn btn-sm btn-secondary" @click="reconnectInstance">
+                            Reconnect ACE {{ selectedInstance }}
+                        </button>
+                        <button class="btn btn-sm btn-secondary" @click="redetectInstance" title="Recover an instance stuck on the wrong protocol after an incomplete startup USB scan">
+                            Re-detect
+                        </button>
+                    </div>
+
+                    <div class="control-block">
+                        <span class="control-block-label">Purge Amount (next toolchange)</span>
+                        <input type="number" class="purge-input" v-model.number="purgeLength" min="1" max="2000" placeholder="Length (mm)">
+                        <input type="number" class="purge-input" v-model.number="purgeSpeed" min="1" max="6000" placeholder="Speed (mm/min)">
+                        <button class="btn btn-sm btn-primary full-width" @click="setPurgeAmount">Set Purge</button>
+                    </div>
+
+                    <div class="control-block">
+                        <span class="control-block-label">Endless Spool</span>
+                        <span class="control-block-state" :class="{ on: endlessSpoolEnabled }">
+                            {{ endlessSpoolEnabled ? 'ON' : 'OFF' }}
+                        </span>
+                        <button class="btn btn-sm btn-success" :disabled="endlessSpoolEnabled" @click="enableEndlessSpool">Enable</button>
+                        <button class="btn btn-sm btn-warning" :disabled="!endlessSpoolEnabled" @click="disableEndlessSpool">Disable</button>
+                        <select class="match-mode-select" :value="endlessSpoolMatchMode" @change="setEndlessSpoolMode" :disabled="!endlessSpoolEnabled">
+                            <option value="exact">Exact (Material + Color)</option>
+                            <option value="material">Material Only</option>
+                            <option value="next">Next Ready Spool</option>
+                        </select>
+                    </div>
+
+                    <div class="control-block">
+                        <span class="control-block-label">RFID Sync (ACE {{ selectedInstance }})</span>
+                        <span class="control-block-state" :class="{ on: rfidSyncEnabled }">
+                            {{ rfidSyncEnabled ? 'ON' : 'OFF' }}
+                        </span>
+                        <button class="btn btn-sm btn-success" :disabled="rfidSyncEnabled" @click="enableRfidSync">Enable</button>
+                        <button class="btn btn-sm btn-warning" :disabled="!rfidSyncEnabled" @click="disableRfidSync">Disable</button>
+                    </div>
+
+                    <div class="control-block">
+                        <span class="control-block-label">Tangle Detection</span>
+                        <button class="btn btn-sm btn-success" @click="enableTangleDetection">Enable</button>
+                        <button class="btn btn-sm btn-warning" @click="disableTangleDetection">Disable</button>
+                    </div>
+                </div>
+            </div>
+
             <!-- Slots Grid -->
             <div class="card slots-card">
                 <h2>{{ t('cards.slots') }}</h2>
@@ -212,39 +273,86 @@
                                         <span class="value">{{ getRfidStatusText(slot.rfid) }}</span>
                                     </div>
                                 </div>
-                                
+
                                 <div class="slot-actions">
-                                    <button 
-                                        @click="changeToolForInstance(slot.tool !== null && slot.tool !== undefined ? slot.tool : slot.index, inst.index)" 
+                                    <button
+                                        @click="changeToolForInstance(slot.tool !== null && slot.tool !== undefined ? slot.tool : slot.index, inst.index)"
                                         :disabled="slot.status !== 'ready' || isCurrentToolSlot(slot, inst.index)"
                                         class="btn btn-sm btn-primary"
                                     >
                                         {{ t('buttons.load') }}
                                     </button>
-                                    <button 
-                                        @click="unloadFilament(inst.index)" 
+                                    <button
+                                        @click="unloadFilament(inst.index)"
                                         class="btn btn-sm btn-secondary"
                                     >
                                         {{ t('buttons.unload') }}
                                     </button>
-                                    <button 
-                                        @click="enableFeedAssist(slot.index, inst.index)" 
+                                    <button
+                                        @click="enableFeedAssist(slot.index, inst.index)"
                                         :disabled="slot.status !== 'ready' || inst.feedAssistSlot === slot.index"
                                         class="btn btn-sm btn-success"
                                     >
                                         {{ t('buttons.assistOn') }}
                                     </button>
-                                    <button 
-                                        @click="disableFeedAssist(slot.index, inst.index)" 
+                                    <button
+                                        @click="disableFeedAssist(slot.index, inst.index)"
                                         :disabled="inst.feedAssistSlot !== slot.index"
                                         class="btn btn-sm btn-warning"
                                     >
                                         {{ t('buttons.assistOff') }}
                                     </button>
+                                    <button
+                                        @click="openManageModal(getSlotToolNumber(slot, inst.index))"
+                                        class="btn btn-sm btn-secondary full-width"
+                                    >
+                                        Manage...
+                                    </button>
                                 </div>
                             </div>
                         </div>
                     </div>
+                </div>
+            </div>
+
+            <!-- Advanced: State Override -->
+            <div class="card advanced-card">
+                <h2>&#9888; Advanced: State Override</h2>
+                <button v-if="!showAdvanced" class="btn btn-warning" @click="showAdvanced = true">
+                    Show Advanced Controls
+                </button>
+                <div v-if="showAdvanced">
+                    <p class="advanced-warning">
+                        These only edit the system's saved BELIEF about what's loaded, what toolchange is
+                        in flight, and where the filament tip is - they never physically move filament.
+                        Use them only after manually verifying the real state (e.g. after a manual unload
+                        or a memory reset) - a wrong value here can jam the next toolchange.
+                    </p>
+
+                    <div class="control-block">
+                        <span class="control-block-label">Current Tool (now: {{ toolLabel(currentTool) }})</span>
+                        <input type="number" class="purge-input" v-model.number="overrideCurrentIndexInput" min="-1" placeholder="-1 = none">
+                        <button class="btn btn-sm btn-warning" @click="requestOverrideCurrentIndex">Override</button>
+                    </div>
+
+                    <div class="control-block">
+                        <span class="control-block-label">In-Flight Target (now: {{ toolLabel(targetTool) }})</span>
+                        <input type="number" class="purge-input" v-model.number="overrideTargetIndexInput" min="-1" placeholder="-1 = none">
+                        <button class="btn btn-sm btn-warning" @click="requestOverrideTargetIndex">Override</button>
+                    </div>
+
+                    <div class="control-block">
+                        <span class="control-block-label">Filament Position (now: {{ filamentPos }})</span>
+                        <select class="match-mode-select" v-model="overrideFilamentStateInput">
+                            <option value="bowden">Bowden (parked, unloaded)</option>
+                            <option value="splitter">Splitter / RDM</option>
+                            <option value="toolhead">Toolhead sensor</option>
+                            <option value="nozzle">Nozzle (fully loaded)</option>
+                        </select>
+                        <button class="btn btn-sm btn-warning full-width" @click="requestOverrideFilamentState">Override</button>
+                    </div>
+
+                    <button class="btn btn-secondary" @click="showAdvanced = false">Hide Advanced Controls</button>
                 </div>
             </div>
 
@@ -261,44 +369,181 @@
                     <button @click="refreshStatus" class="btn btn-secondary">
                         {{ t('quickActions.refresh') }}
                     </button>
+                    <button @click="flushToDisk" class="btn btn-info" title="Persist any pending Spoolman/slot changes to disk immediately">
+                        Flush to Disk
+                    </button>
                 </div>
             </div>
         </div>
 
-        <!-- Feed Dialog -->
-        <div v-if="showFeedModal" class="modal-overlay" @click="closeFeedDialog">
-            <div class="modal" @click.stop>
-                <h3>{{ t('dialogs.feedTitle', { slot: feedSlot }) }}</h3>
-                <div class="form-group">
-                    <label>{{ t('dialogs.length') }}</label>
-                    <input type="number" v-model.number="feedLength" min="1" max="2000">
-                </div>
-                <div class="form-group">
-                    <label>{{ t('dialogs.speed') }}</label>
-                    <input type="number" v-model.number="feedSpeed" min="1" max="100">
-                </div>
+        <!-- Override Confirmation Modal (Advanced: State Override) -->
+        <div v-if="showOverrideConfirm" class="modal-overlay">
+            <div class="modal">
+                <h3>{{ overrideConfirmTitle }}</h3>
+                <p class="advanced-warning">{{ overrideConfirmDetail }}</p>
                 <div class="modal-actions">
-                    <button @click="executeFeed" class="btn btn-primary">{{ t('dialogs.execute') }}</button>
-                    <button @click="closeFeedDialog" class="btn btn-secondary">{{ t('dialogs.cancel') }}</button>
+                    <button class="btn btn-warning" @click="confirmOverride">Yes, Override</button>
+                    <button class="btn btn-secondary" @click="cancelOverrideConfirm">Cancel</button>
                 </div>
             </div>
         </div>
 
-        <!-- Retract Dialog -->
-        <div v-if="showRetractModal" class="modal-overlay" @click="closeRetractDialog">
-            <div class="modal" @click.stop>
-                <h3>{{ t('dialogs.retractTitle', { slot: retractSlot }) }}</h3>
-                <div class="form-group">
-                    <label>{{ t('dialogs.length') }}</label>
-                    <input type="number" v-model.number="retractLength" min="1" max="2000">
-                </div>
-                <div class="form-group">
-                    <label>{{ t('dialogs.speed') }}</label>
-                    <input type="number" v-model.number="retractSpeed" min="1" max="100">
-                </div>
+        <!-- Manage Slot Modal: everything that isn't a one-tap card action
+             (Feed/Retract/Stop, persistent speeds, Spoolman, Full Unload)
+             lives here instead of stacking ~10 buttons on every slot card. -->
+        <div
+            v-if="showManageModal"
+            class="modal-overlay"
+            @mousedown="manageOverlayMouseDownOnSelf = ($event.target === $event.currentTarget)"
+            @click="onManageOverlayClick"
+        >
+            <div class="modal manage-modal" @click.stop>
+                <h3>Manage T{{ manageTool }}</h3>
+                <p class="manage-note">
+                    Feed/Retract below are manual, one-off jogs - separate from the
+                    automatic feed/retract speeds used during normal toolchanges.
+                    "Adjust Running" only retunes a feed/retract while it's active;
+                    it isn't a saved setting.
+                </p>
+
+                <fieldset class="manage-section">
+                    <legend>Feed</legend>
+                    <div class="form-group">
+                        <label>Length (mm)</label>
+                        <input type="number" v-model.number="feedLength" min="1" max="2000">
+                    </div>
+                    <div class="form-group">
+                        <label>Speed (mm/s)</label>
+                        <input type="number" v-model.number="feedSpeed" min="1" max="100">
+                    </div>
+                    <div class="modal-actions tight">
+                        <button class="btn btn-primary" @click="manageFeed">Feed</button>
+                        <button class="btn btn-secondary" @click="manageStopFeed">Stop</button>
+                        <button class="btn btn-outline-success" @click="manageAdjustFeedSpeed" title="Retunes the speed of a feed that is CURRENTLY IN PROGRESS on this slot. Does nothing if nothing is running, and is not a saved default.">
+                            Adjust Running Feed
+                        </button>
+                    </div>
+                </fieldset>
+
+                <fieldset class="manage-section">
+                    <legend>Retract</legend>
+                    <div class="form-group">
+                        <label>Length (mm)</label>
+                        <input type="number" v-model.number="retractLength" min="1" max="2000">
+                    </div>
+                    <div class="form-group">
+                        <label>Speed (mm/s)</label>
+                        <input type="number" v-model.number="retractSpeed" min="1" max="100">
+                    </div>
+                    <div class="modal-actions tight">
+                        <button class="btn btn-primary" @click="manageRetract">Retract</button>
+                        <button class="btn btn-secondary" @click="manageStopRetract">Stop</button>
+                        <button class="btn btn-outline-success" @click="manageAdjustRetractSpeed" title="Retunes the speed of a retract that is CURRENTLY IN PROGRESS on this slot. Does nothing if nothing is running, and is not a saved default.">
+                            Adjust Running Retract
+                        </button>
+                    </div>
+                </fieldset>
+
+                <fieldset class="manage-section" v-if="spoolmanEnabled">
+                    <legend>Spoolman</legend>
+                    <div class="form-group">
+                        <label>Spoolman ID (SKU: {{ manageSku || 'none' }})</label>
+                        <input type="number" v-model.number="manageSpoolmanId" min="0">
+                    </div>
+                    <div class="modal-actions tight">
+                        <button class="btn btn-info" :disabled="!manageSku" @click="manageMapSku" title="Permanently map this slot's SKU to the Spoolman ID above">
+                            Map SKU
+                        </button>
+                        <button class="btn btn-info" @click="manageSetManualSlot" title="Lock this physical slot to the Spoolman ID above, regardless of RFID">
+                            Set Slot
+                        </button>
+                    </div>
+                </fieldset>
+
                 <div class="modal-actions">
-                    <button @click="executeRetract" class="btn btn-primary">{{ t('dialogs.execute') }}</button>
-                    <button @click="closeRetractDialog" class="btn btn-secondary">{{ t('dialogs.cancel') }}</button>
+                    <button class="btn btn-danger" @click="manageFullUnload" title="Retract this slot until empty, regardless of whether it's currently loaded">
+                        Full Unload
+                    </button>
+                    <button class="btn btn-secondary" @click="closeManageModal">Close</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Tool Change Failed Recovery Dialog -->
+        <div v-if="showTcfModal" class="modal-overlay">
+            <div class="modal tcf-modal">
+                <h3>Tool Change Failed</h3>
+                <p class="tcf-error">T{{ toolchangeFailedTool }}: {{ toolchangeFailedError || 'Unknown error' }}</p>
+
+                <div class="form-group">
+                    <label>Target tool for the actions below:</label>
+                    <div class="tcf-tool-picker">
+                        <button
+                            v-for="tool in tcfAllTools()"
+                            :key="tool"
+                            type="button"
+                            class="tcf-tool-btn"
+                            :class="{ loaded: tool === currentTool, selected: tool === tcfSelectedTool }"
+                            @click="tcfSelectedTool = tool"
+                        >T{{ tool }}</button>
+                    </div>
+                    <div class="tcf-tool-status">
+                        Selected: T{{ tcfSelectedTool }}
+                        <span v-if="currentTool >= 0"> &middot; currently loaded: T{{ currentTool }}</span>
+                        <span v-else> &middot; no tool currently loaded</span>
+                    </div>
+                </div>
+
+                <div class="form-group tcf-sensor-row">
+                    <span class="tcf-sensor" :class="sensorClass(toolheadSensor)">Toolhead: {{ sensorText(toolheadSensor) }}</span>
+                    <span class="tcf-sensor" :class="sensorClass(rdmSensor)">RDM: {{ sensorText(rdmSensor) }}</span>
+                </div>
+
+                <div class="form-group tcf-feed-assist-row">
+                    <span>Feed Assist (selected tool):</span>
+                    <span class="tcf-feed-assist-state" :class="{ on: tcfFeedAssistOnFor(tcfSelectedTool) }">
+                        {{ tcfFeedAssistOnFor(tcfSelectedTool) ? 'ON' : 'OFF' }}
+                    </span>
+                    <button class="btn btn-sm btn-success" :disabled="tcfFeedAssistOnFor(tcfSelectedTool)" @click="tcfEnableFeedAssist">Enable</button>
+                    <button class="btn btn-sm btn-warning" :disabled="!tcfFeedAssistOnFor(tcfSelectedTool)" @click="tcfDisableFeedAssist">Disable</button>
+                </div>
+
+                <fieldset class="tcf-axis">
+                    <legend>Toolhead Extruder</legend>
+                    <div class="tcf-slider-row">
+                        <label>Length: {{ tcfExtrudeLength }} mm</label>
+                        <input type="range" min="5" max="200" step="5" v-model.number="tcfExtrudeLength">
+                    </div>
+                    <div class="tcf-slider-row">
+                        <label>Speed: {{ tcfExtrudeSpeed }} mm/min</label>
+                        <input type="range" min="60" max="900" step="30" v-model.number="tcfExtrudeSpeed">
+                    </div>
+                    <div class="modal-actions tight">
+                        <button class="btn btn-primary" @click="tcfExtruderExtrude">Extrude</button>
+                        <button class="btn btn-secondary" @click="tcfExtruderRetract">Retract</button>
+                    </div>
+                </fieldset>
+
+                <fieldset class="tcf-axis">
+                    <legend>ACE Motor (selected tool's slot)</legend>
+                    <div class="tcf-slider-row">
+                        <label>Length: {{ tcfAceLength }} mm</label>
+                        <input type="range" min="10" max="300" step="10" v-model.number="tcfAceLength">
+                    </div>
+                    <div class="tcf-slider-row">
+                        <label>Speed: {{ tcfAceSpeed }} mm/s</label>
+                        <input type="range" min="5" max="80" step="5" v-model.number="tcfAceSpeed">
+                    </div>
+                    <div class="modal-actions tight">
+                        <button class="btn btn-primary" @click="tcfAceFeed">Feed</button>
+                        <button class="btn btn-secondary" @click="tcfAceRetract">Retract</button>
+                    </div>
+                </fieldset>
+
+                <div class="modal-actions tcf-footer">
+                    <button class="btn btn-danger" @click="tcfCancelPrint">Cancel Print</button>
+                    <button class="btn btn-info" @click="tcfRetry">Retry Selected Tool</button>
+                    <button class="btn btn-primary" @click="tcfResume">Resume</button>
                 </div>
             </div>
         </div>
@@ -309,6 +554,6 @@
         </div>
     </div>
 
-    <script src="ace-dashboard.js?v=20260308b"></script>
+    <script src="ace-dashboard.js?v=20260919b"></script>
 </body>
 </html>
